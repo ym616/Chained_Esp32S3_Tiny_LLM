@@ -67,9 +67,8 @@ def main():
         # Flash the model to SPIFFS
         spiffs_bin = f"node{i}.bin"
         if os.path.exists(spiffs_bin):
-            print(f"\n[*] Flashing SPIFFS partition (model weights) to Node {i} on {ports[i]}...")
-            # We use esptool directly based on the partitions.csv offset 0x310000
-            run_command(f"esptool.py --chip esp32s3 -p {ports[i]} write_flash 0x310000 {spiffs_bin}")
+            print(f"\n[*] Flashing model partition to Node {i} on {ports[i]}...")
+            run_command(f"parttool.py --port {ports[i]} write_partition --partition-name model --input {spiffs_bin}")
         else:
             print(f"Warning: {spiffs_bin} not found. Skipping SPIFFS upload for Node {i}.")
             

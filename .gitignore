@@ -1,0 +1,15 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# ESP-IDF
+build/
+sdkconfig
+sdkconfig.old
+
+# Model binaries and test dumps
+*.bin
+
+# Temporary / mock files
+mock.cpp

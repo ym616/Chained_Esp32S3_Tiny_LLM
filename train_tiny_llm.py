@@ -37,15 +37,15 @@ def main():
         "python train.py "
         "--out_dir=out "
         "--dataset=tinystories "
-        "--dim=288 "          # Hidden dimension
-        "--n_layers=6 "       # Number of layers
-        "--n_heads=6 "        # Number of attention heads
-        "--n_kv_heads=6 "
+        "--dim=768 "          # Hidden dimension
+        "--n_layers=12 "       # Number of layers
+        "--n_heads=12 "        # Number of attention heads
+        "--n_kv_heads=12 "
         "--multiple_of=32 "
         "--max_seq_len=256 "  # Max context length
         "--vocab_source=custom "
         "--vocab_size=4096 "  # Smaller vocab for memory savings
-        "--batch_size=16 "    # Lower batch size
+        "--batch_size=8 "    # Lower batch size to prevent OOM
         "--max_iters=5000 "   # Adjust based on desired quality vs time
         "--device=cpu "       # Change to 'cuda' if you have an Nvidia GPU
         "--compile=False"     # Disable PyTorch compile for simpler setup

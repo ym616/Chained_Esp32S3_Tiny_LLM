@@ -21,11 +21,17 @@ def main():
     else:
         print("\n[*] llama2.c repository already exists. Skipping clone.")
 
-    # 2. Download and pre-tokenize dataset (TinyStories)
-    print("\n[*] Downloading and preparing TinyStories dataset...")
-    # This downloads the dataset and pretokenizes it using the custom tokenizer
-    run_command("python tinystories.py download", cwd=repo_dir)
-    run_command("python tinystories.py pretokenize", cwd=repo_dir)
+    # 2. Generate custom dataset and pre-tokenize it
+    if not os.path.exists(os.path.join(repo_dir, "data", "tok2048")):
+        print("\n[*] Generating custom Gordon Ramsay error dataset...")
+        # This generates the dataset JSON directly in llama2.c/data/TinyStories_all_data
+        run_command(f"{sys.executable} ../generate_dataset.py", cwd=repo_dir)
+        print("\n[*] Training custom vocab...")
+        run_command(f"echo N | {sys.executable} tinystories.py train_vocab --vocab_size=2048", cwd=repo_dir)
+        print("\n[*] Pretokenizing dataset...")
+        run_command(f"{sys.executable} tinystories.py pretokenize --vocab_size=2048", cwd=repo_dir)
+    else:
+        print("\n[*] Dataset and tokens already exist. Skipping generation/tokenization.")
 
     # 3. Train a tiny model
     # We will configure a tiny model (e.g. 15M parameters) so it trains relatively quickly
@@ -36,7 +42,6 @@ def main():
     train_cmd = (
         "python train.py "
         "--out_dir=out "
-        "--dataset=tinystories "
         "--dim=768 "          # Hidden dimension
         "--n_layers=12 "       # Number of layers
         "--n_heads=12 "        # Number of attention heads
@@ -44,18 +49,20 @@ def main():
         "--multiple_of=32 "
         "--max_seq_len=256 "  # Max context length
         "--vocab_source=custom "
-        "--vocab_size=4096 "  # Smaller vocab for memory savings
-        "--batch_size=8 "    # Lower batch size to prevent OOM
+        "--vocab_size=2048 "  # Smaller vocab for memory savings
+        "--batch_size=8 "    # CPU can handle this comfortably
         "--max_iters=5000 "   # Adjust based on desired quality vs time
-        "--device=cpu "       # Change to 'cuda' if you have an Nvidia GPU
-        "--compile=False"     # Disable PyTorch compile for simpler setup
+        "--device=cpu "       # Changed back to cpu to avoid Arc XPU bugs
+        "--compile=False "    # Disable PyTorch compile for simpler setup
+        "--eval_interval=200 "
+        "--eval_iters=20 "
     )
     run_command(train_cmd, cwd=repo_dir)
 
     # 4. Export the model to binary format
     print("\n[*] Exporting trained model to binary format...")
     # Export the final model. model.pt is saved in the out_dir.
-    export_cmd = "python export.py ../my_fine_tuned_model.bin --meta-vocab tinystories --version 1"
+    export_cmd = "python export.py ../my_fine_tuned_model.bin --checkpoint out/ckpt.pt --version 1"
     run_command(export_cmd, cwd=repo_dir)
 
     print("\n=== Training and Export Complete! ===")

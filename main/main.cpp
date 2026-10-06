@@ -34,24 +34,24 @@ typedef struct {
 
 typedef struct {
     float* token_embedding_scales;
-    int8_t* token_embedding_table;
+    uint8_t* token_embedding_table;
     float* rms_final_weight;
     float* wcls_scales;
-    int8_t* wcls;
+    uint8_t* wcls;
     float* freq_cis_real;
     float* freq_cis_imag;
 } GlobalWeights;
 
 typedef struct {
     float* rms_att_weight[32];
-    float* wq_scales[32]; int8_t* wq[32];
-    float* wk_scales[32]; int8_t* wk[32];
-    float* wv_scales[32]; int8_t* wv[32];
-    float* wo_scales[32]; int8_t* wo[32];
+    float* wq_scales[32]; uint8_t* wq[32];
+    float* wk_scales[32]; uint8_t* wk[32];
+    float* wv_scales[32]; uint8_t* wv[32];
+    float* wo_scales[32]; uint8_t* wo[32];
     float* rms_ffn_weight[32];
-    float* w1_scales[32]; int8_t* w1[32];
-    float* w2_scales[32]; int8_t* w2[32];
-    float* w3_scales[32]; int8_t* w3[32];
+    float* w1_scales[32]; uint8_t* w1[32];
+    float* w2_scales[32]; uint8_t* w2[32];
+    float* w3_scales[32]; uint8_t* w3[32];
 } LayerWeights;
 
 Config config;
@@ -111,39 +111,39 @@ void load_model_mmap() {
     
     if (NODE_ID == 1) {
         weights.token_embedding_scales = (float*)ptr; ptr += config.vocab_size * sizeof(float);
-        weights.token_embedding_table = (int8_t*)ptr; ptr += config.vocab_size * config.dim;
+        weights.token_embedding_table = (uint8_t*)ptr; ptr += (config.vocab_size * config.dim) / 2;
     }
     
     for (int i = 0; i < config.n_layers; i++) {
         layer_weights.rms_att_weight[i] = (float*)ptr; ptr += config.dim * sizeof(float);
         layer_weights.wq_scales[i] = (float*)ptr; ptr += config.dim * sizeof(float);
-        layer_weights.wq[i] = (int8_t*)ptr; ptr += config.dim * config.dim;
+        layer_weights.wq[i] = (uint8_t*)ptr; ptr += (config.dim * config.dim) / 2;
         
         layer_weights.wk_scales[i] = (float*)ptr; ptr += kv_dim * sizeof(float);
-        layer_weights.wk[i] = (int8_t*)ptr; ptr += kv_dim * config.dim;
+        layer_weights.wk[i] = (uint8_t*)ptr; ptr += (kv_dim * config.dim) / 2;
         
         layer_weights.wv_scales[i] = (float*)ptr; ptr += kv_dim * sizeof(float);
-        layer_weights.wv[i] = (int8_t*)ptr; ptr += kv_dim * config.dim;
+        layer_weights.wv[i] = (uint8_t*)ptr; ptr += (kv_dim * config.dim) / 2;
         
         layer_weights.wo_scales[i] = (float*)ptr; ptr += config.dim * sizeof(float);
-        layer_weights.wo[i] = (int8_t*)ptr; ptr += config.dim * config.dim;
+        layer_weights.wo[i] = (uint8_t*)ptr; ptr += (config.dim * config.dim) / 2;
         
         layer_weights.rms_ffn_weight[i] = (float*)ptr; ptr += config.dim * sizeof(float);
         
         layer_weights.w1_scales[i] = (float*)ptr; ptr += config.hidden_dim * sizeof(float);
-        layer_weights.w1[i] = (int8_t*)ptr; ptr += config.hidden_dim * config.dim;
+        layer_weights.w1[i] = (uint8_t*)ptr; ptr += (config.hidden_dim * config.dim) / 2;
         
         layer_weights.w2_scales[i] = (float*)ptr; ptr += config.dim * sizeof(float);
-        layer_weights.w2[i] = (int8_t*)ptr; ptr += config.dim * config.hidden_dim;
+        layer_weights.w2[i] = (uint8_t*)ptr; ptr += (config.dim * config.hidden_dim) / 2;
         
         layer_weights.w3_scales[i] = (float*)ptr; ptr += config.hidden_dim * sizeof(float);
-        layer_weights.w3[i] = (int8_t*)ptr; ptr += config.hidden_dim * config.dim;
+        layer_weights.w3[i] = (uint8_t*)ptr; ptr += (config.hidden_dim * config.dim) / 2;
     }
     
     if (NODE_ID == 3) {
         weights.rms_final_weight = (float*)ptr; ptr += config.dim * sizeof(float);
         weights.wcls_scales = (float*)ptr; ptr += config.vocab_size * sizeof(float);
-        weights.wcls = (int8_t*)ptr; ptr += config.vocab_size * config.dim;
+        weights.wcls = (uint8_t*)ptr; ptr += (config.vocab_size * config.dim) / 2;
     }
     
     weights.freq_cis_real = (float*)ptr; ptr += config.seq_len * (head_size / 2) * sizeof(float);
@@ -175,7 +175,7 @@ void rmsnorm(float* o, float* x, float* weight, int size) {
     }
 }
 
-void matmul_q(float* xout, float* x, int8_t* w, float* scales, int n, int d) {
+void matmul_q(float* xout, float* x, uint8_t* w_packed, float* scales, int n, int d) {
     float max_val = 0.0f;
     for(int i=0; i<n; i++) {
         float f = fabsf(x[i]);
@@ -191,9 +191,14 @@ void matmul_q(float* xout, float* x, int8_t* w, float* scales, int n, int d) {
     
     for (int i = 0; i < d; i++) {
         int32_t val = 0;
-        int idx = i * n;
-        for (int j = 0; j < n; j++) {
-            val += w[idx + j] * xq_buffer[j];
+        int idx = i * (n / 2); // each row has n/2 packed bytes
+        for (int j = 0; j < (n / 2); j++) {
+            uint8_t packed = w_packed[idx + j];
+            int8_t w0 = (packed & 0x0F) - 7;
+            int8_t w1 = ((packed >> 4) & 0x0F) - 7;
+            
+            val += w0 * xq_buffer[j*2];
+            val += w1 * xq_buffer[j*2 + 1];
         }
         xout[i] = ((float)val) * (scales[i] * x_scale);
     }
@@ -276,9 +281,13 @@ void head_node_task(void *pvParameters) {
         vTaskDelay(pdMS_TO_TICKS(1000));
         
         float scale = weights.token_embedding_scales[token_id];
-        int8_t* row = weights.token_embedding_table + token_id * config.dim;
-        for(int i=0; i<config.dim; i++) {
-            activation_vector[i] = ((float)row[i]) * scale;
+        uint8_t* row = weights.token_embedding_table + token_id * (config.dim / 2);
+        for(int i=0; i < (config.dim / 2); i++) {
+            uint8_t packed = row[i];
+            int8_t w0 = (packed & 0x0F) - 7;
+            int8_t w1 = ((packed >> 4) & 0x0F) - 7;
+            activation_vector[i*2] = ((float)w0) * scale;
+            activation_vector[i*2 + 1] = ((float)w1) * scale;
         }
         
         compute_layers(activation_vector, pos);

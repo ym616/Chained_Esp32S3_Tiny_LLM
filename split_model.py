@@ -10,16 +10,24 @@ def read_int(f):
 
 def quantize_tensor(tensor_bytes, rows, cols):
     """
-    Quantizes a float32 tensor of shape (rows, cols) into int8.
-    Returns (scales_bytes, int8_bytes)
-    where scales_bytes is float32 array of shape (rows,)
+    Quantizes a float32 tensor of shape (rows, cols) into 4-bit.
+    Returns (scales_bytes, int4_packed_bytes)
     """
     tensor = np.frombuffer(tensor_bytes, dtype=np.float32).reshape(rows, cols)
     max_abs = np.abs(tensor).max(axis=1)
-    scales = max_abs / 127.0
+    scales = max_abs / 7.0
     scales[scales == 0] = 1e-9
-    quantized = np.clip(np.round(tensor / scales[:, None]), -127, 127).astype(np.int8)
-    return scales.astype(np.float32).tobytes(), quantized.tobytes()
+    
+    # Quantize to -7 to 7
+    quantized = np.clip(np.round(tensor / scales[:, None]), -7, 7).astype(np.int8)
+    
+    # Offset by +7 to make them strictly 0 to 14 (positive uint8)
+    q_offset = (quantized + 7).astype(np.uint8)
+    
+    # Pack 2 values into 1 byte (cols must be even)
+    packed = (q_offset[:, 0::2] & 0x0F) | ((q_offset[:, 1::2] & 0x0F) << 4)
+    
+    return scales.astype(np.float32).tobytes(), packed.tobytes()
 
 def quantize_1d(tensor_bytes, size):
     """

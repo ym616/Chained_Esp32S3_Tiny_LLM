@@ -9,6 +9,16 @@
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_heap_caps.h"
+#include "esp_spi_flash.h"
+
+#ifndef ESP_PARTITION_MMAP_DATA
+#define ESP_PARTITION_MMAP_DATA SPI_FLASH_MMAP_DATA
+typedef spi_flash_mmap_handle_t esp_partition_mmap_handle_t;
+#endif
+
+#ifndef UART_SCLK_DEFAULT
+#define UART_SCLK_DEFAULT UART_SCLK_APB
+#endif
 
 static const char *TAG = "CHAINED_ESP32S3_LLM";
 
@@ -356,7 +366,19 @@ void tail_node_task(void *pvParameters) {
 }
 #endif
 
+#ifdef ARDUINO
+#include <Arduino.h>
+void llm_main(void);
+void setup() {
+    llm_main();
+}
+void loop() {
+    vTaskDelay(pdMS_TO_TICKS(1000));
+}
+void llm_main(void) {
+#else
 extern "C" void app_main(void) {
+#endif
     ESP_LOGI(TAG, "Chained Esp32S3 tiny LLM Cluster initializing...");
     init_uart_ring();
     load_model_mmap();
@@ -371,3 +393,4 @@ extern "C" void app_main(void) {
     #error "Invalid NODE_ID specified!"
 #endif
 }
+

@@ -3,11 +3,6 @@ import sys
 import os
 import numpy as np
 
-def read_int(f):
-    b = f.read(4)
-    if not b: return None
-    return struct.unpack('i', b)[0]
-
 def quantize_tensor(tensor_bytes, rows, cols):
     """
     Quantizes a float32 tensor of shape (rows, cols) into 4-bit.
@@ -29,31 +24,45 @@ def quantize_tensor(tensor_bytes, rows, cols):
     
     return scales.astype(np.float32).tobytes(), packed.tobytes()
 
-def quantize_1d(tensor_bytes, size):
-    """
-    1D tensors like RMSNorm weights are left as float32 to preserve precision.
-    Returns original bytes.
-    """
-    return tensor_bytes
+def precompute_freqs_cis(head_dim, max_seq_len, theta=10000.0):
+    freqs = 1.0 / (theta ** (np.arange(0, head_dim, 2)[: (head_dim // 2)].astype(np.float32) / head_dim))
+    t = np.arange(max_seq_len, dtype=np.float32)
+    freqs = np.outer(t, freqs)
+    freqs_cos = np.cos(freqs).astype(np.float32)
+    freqs_sin = np.sin(freqs).astype(np.float32)
+    return freqs_cos.tobytes(), freqs_sin.tobytes()
 
 def split_model(bin_path):
     if not os.path.exists(bin_path):
         print(f"Error: {bin_path} not found.")
         sys.exit(1)
         
-    print(f"Splitting and quantizing {bin_path}...")
+    print(f"[*] Splitting and quantizing {bin_path}...")
     
     with open(bin_path, 'rb') as f:
         header = f.read(256)
-        config = struct.unpack('7i', header[:28])
+        
+        # Check if version 1 (starts with magic 0x616b3432 '24ka')
+        if header[:4] == b'24ka':
+            version = struct.unpack('i', header[4:8])[0]
+            config = struct.unpack('7i', header[8:36])
+            shared_classifier = struct.unpack('B', header[36:37])[0]
+            is_v1 = True
+        else:
+            config = struct.unpack('7i', header[:28])
+            shared_classifier = config[5] > 0
+            is_v1 = False
+
         dim, hidden_dim, n_layers, n_heads, n_kv_heads, vocab_size, max_seq_len = config
+        vocab_size = abs(vocab_size)
         
         print(f"Model Config: dim={dim}, hidden_dim={hidden_dim}, n_layers={n_layers}")
         print(f"n_heads={n_heads}, n_kv_heads={n_kv_heads}, vocab_size={vocab_size}, max_seq_len={max_seq_len}")
+        print(f"Shared classifier: {shared_classifier}")
         
         head_size = dim // n_heads
         
-        # Sizes in float32
+        # Tensor byte sizes in float32
         S_tok_emb = vocab_size * dim * 4
         S_rms_att = dim * 4
         S_wq = dim * dim * 4
@@ -65,37 +74,59 @@ def split_model(bin_path):
         S_w2 = dim * hidden_dim * 4
         S_w3 = hidden_dim * dim * 4
         S_rms_final = dim * 4
-        S_freq_cis_real = max_seq_len * (head_size // 2) * 4
-        S_freq_cis_imag = max_seq_len * (head_size // 2) * 4
         
-        # Read tensors
-        tok_emb = f.read(S_tok_emb)
-        rms_att = [f.read(S_rms_att) for _ in range(n_layers)]
-        wq = [f.read(S_wq) for _ in range(n_layers)]
-        wk = [f.read(S_wk) for _ in range(n_layers)]
-        wv = [f.read(S_wv) for _ in range(n_layers)]
-        wo = [f.read(S_wo) for _ in range(n_layers)]
-        rms_ffn = [f.read(S_rms_ffn) for _ in range(n_layers)]
-        w1 = [f.read(S_w1) for _ in range(n_layers)]
-        w2 = [f.read(S_w2) for _ in range(n_layers)]
-        w3 = [f.read(S_w3) for _ in range(n_layers)]
-        rms_final = f.read(S_rms_final)
-        freq_cis_real = f.read(S_freq_cis_real)
-        freq_cis_imag = f.read(S_freq_cis_imag)
-        
-        # Check if weights are shared (wcls == tok_emb)
-        f.seek(0, os.SEEK_END)
-        file_size = f.tell()
-        expected_size_shared = 256 + S_tok_emb + n_layers * (S_rms_att + S_wq + S_wk + S_wv + S_wo + S_rms_ffn + S_w1 + S_w2 + S_w3) + S_rms_final + S_freq_cis_real + S_freq_cis_imag
-        
-        if file_size > expected_size_shared:
-            f.seek(expected_size_shared)
-            wcls = f.read(S_tok_emb)
+        if is_v1:
+            # Version 1 order:
+            # attention_norm for all layers
+            # ffn_norm for all layers
+            # norm.weight (rms_final)
+            # tok_embeddings
+            # wq for all layers
+            # wk for all layers
+            # wv for all layers
+            # wo for all layers
+            # w1 for all layers
+            # w2 for all layers
+            # w3 for all layers
+            # output (if not shared)
+            rms_att = [f.read(S_rms_att) for _ in range(n_layers)]
+            rms_ffn = [f.read(S_rms_ffn) for _ in range(n_layers)]
+            rms_final = f.read(S_rms_final)
+            tok_emb = f.read(S_tok_emb)
+            wq = [f.read(S_wq) for _ in range(n_layers)]
+            wk = [f.read(S_wk) for _ in range(n_layers)]
+            wv = [f.read(S_wv) for _ in range(n_layers)]
+            wo = [f.read(S_wo) for _ in range(n_layers)]
+            w1 = [f.read(S_w1) for _ in range(n_layers)]
+            w2 = [f.read(S_w2) for _ in range(n_layers)]
+            w3 = [f.read(S_w3) for _ in range(n_layers)]
+            if not shared_classifier:
+                wcls = f.read(S_tok_emb)
+            else:
+                wcls = tok_emb
         else:
-            wcls = tok_emb
+            # Legacy v0 order
+            tok_emb = f.read(S_tok_emb)
+            rms_att = [f.read(S_rms_att) for _ in range(n_layers)]
+            wq = [f.read(S_wq) for _ in range(n_layers)]
+            wk = [f.read(S_wk) for _ in range(n_layers)]
+            wv = [f.read(S_wv) for _ in range(n_layers)]
+            wo = [f.read(S_wo) for _ in range(n_layers)]
+            rms_ffn = [f.read(S_rms_ffn) for _ in range(n_layers)]
+            w1 = [f.read(S_w1) for _ in range(n_layers)]
+            w2 = [f.read(S_w2) for _ in range(n_layers)]
+            w3 = [f.read(S_w3) for _ in range(n_layers)]
+            rms_final = f.read(S_rms_final)
+            f.read(max_seq_len * (head_size // 2) * 4) # skip freq_cis_real
+            f.read(max_seq_len * (head_size // 2) * 4) # skip freq_cis_imag
+            if not shared_classifier:
+                wcls = f.read(S_tok_emb)
+            else:
+                wcls = tok_emb
+                
+        freq_cis_real, freq_cis_imag = precompute_freqs_cis(head_size, max_seq_len)
             
-    print("Quantizing tensors to 8-bit...")
-    # Quantize everything
+    print("[*] Quantizing tensors to 4-bit packed format...")
     q_tok_emb = quantize_tensor(tok_emb, vocab_size, dim)
     q_wcls = quantize_tensor(wcls, vocab_size, dim)
     
@@ -123,11 +154,13 @@ def split_model(bin_path):
         end_l = node_boundaries[node_idx]
         l_count = end_l - start_l
         
-        with open(f'node{node_idx}.bin', 'wb') as out:
-            # Modify config to specify l_count and perhaps a flag for quantization
+        out_path = f'node{node_idx}.bin'
+        with open(out_path, 'wb') as out:
+            # Node header (256 bytes):
+            # First 28 bytes are Config struct expected by ESP32 C++ main.cpp
             mod_config = struct.pack('7i', dim, hidden_dim, l_count, n_heads, n_kv_heads, vocab_size, max_seq_len)
             out.write(mod_config)
-            out.write(header[28:]) # remaining padding
+            out.write(b'\0' * (256 - len(mod_config))) # pad to 256 bytes
             
             if node_idx == 1:
                 out.write(q_tok_emb[0]); out.write(q_tok_emb[1]) # scales, weights
@@ -150,8 +183,10 @@ def split_model(bin_path):
             out.write(freq_cis_real)
             out.write(freq_cis_imag)
 
-        size_mb = os.path.getsize(f'node{node_idx}.bin') / (1024*1024)
-        print(f"Node {node_idx}.bin generated with {l_count} layers ({start_l} to {end_l-1}). Size: {size_mb:.2f} MB")
+        size_mb = os.path.getsize(out_path) / (1024*1024)
+        print(f"[*] Node {node_idx}.bin generated with {l_count} layers ({start_l} to {end_l-1}). Size: {size_mb:.2f} MB")
+
+    print("\n[+] Model split complete! Generated node1.bin, node2.bin, and node3.bin")
 
 if __name__ == '__main__':
     if len(sys.argv) < 2:

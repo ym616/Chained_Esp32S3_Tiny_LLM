@@ -9,16 +9,7 @@
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_heap_caps.h"
-#include "esp_spi_flash.h"
-
-#ifndef ESP_PARTITION_MMAP_DATA
-#define ESP_PARTITION_MMAP_DATA SPI_FLASH_MMAP_DATA
-typedef spi_flash_mmap_handle_t esp_partition_mmap_handle_t;
-#endif
-
-#ifndef UART_SCLK_DEFAULT
-#define UART_SCLK_DEFAULT UART_SCLK_APB
-#endif
+#include <Arduino.h>
 
 static const char *TAG = "CHAINED_ESP32S3_LLM";
 
@@ -53,30 +44,41 @@ typedef struct {
 } GlobalWeights;
 
 typedef struct {
-    float* rms_att_weight[32];
-    float* wq_scales[32]; uint8_t* wq[32];
-    float* wk_scales[32]; uint8_t* wk[32];
-    float* wv_scales[32]; uint8_t* wv[32];
-    float* wo_scales[32]; uint8_t* wo[32];
-    float* rms_ffn_weight[32];
-    float* w1_scales[32]; uint8_t* w1[32];
-    float* w2_scales[32]; uint8_t* w2[32];
-    float* w3_scales[32]; uint8_t* w3[32];
-} LayerWeights;
+    float* rms_att_weight;
+    float* wq_scales; uint8_t* wq;
+    float* wk_scales; uint8_t* wk;
+    float* wv_scales; uint8_t* wv;
+    float* wo_scales; uint8_t* wo;
+    float* rms_ffn_weight;
+    float* w1_scales; uint8_t* w1;
+    float* w2_scales; uint8_t* w2;
+    float* w3_scales; uint8_t* w3;
+} SingleLayerWeights;
 
 Config config;
 GlobalWeights weights;
-LayerWeights layer_weights;
+SingleLayerWeights cur_layer;
+const esp_partition_t* model_part = NULL;
 
-float* activation_vector;
-int8_t* xq_buffer; // For quantized inputs
-float* xb;
-float* xb2;
-float* hb;
-float* hb2;
-float* q;
-float* k;
-float* v;
+size_t layer_size = 0;
+size_t layer_flash_offsets[32];
+uint8_t* layer_cache = NULL;
+
+float* activation_vector = NULL;
+int8_t* xq_buffer = NULL;
+float* xb = NULL;
+float* xb2 = NULL;
+float* hb = NULL;
+float* hb2 = NULL;
+float* q = NULL;
+float* k = NULL;
+float* v = NULL;
+
+#define MAX_SEQ_LEN 64
+float* key_cache = NULL;
+float* value_cache = NULL;
+float* att_buffer = NULL;
+
 
 void init_uart_ring() {
     uart_config_t uart_config = {
@@ -85,312 +87,640 @@ void init_uart_ring() {
         .parity    = UART_PARITY_DISABLE,
         .stop_bits = UART_STOP_BITS_1,
         .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
-        .source_clk = UART_SCLK_DEFAULT,
+        .rx_flow_ctrl_thresh = 0,
+        .source_clk = UART_SCLK_APB,
     };
-    ESP_ERROR_CHECK(uart_driver_install(UART_NUM, 4096 * 2, 0, 0, NULL, 0));
+    ESP_ERROR_CHECK(uart_driver_install(UART_NUM, 1024 * 32, 1024 * 32, 0, NULL, 0));
     ESP_ERROR_CHECK(uart_param_config(UART_NUM, &uart_config));
     ESP_ERROR_CHECK(uart_set_pin(UART_NUM, TXD_PIN, RXD_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
-    ESP_LOGI(TAG, "UART2 Ring Initialized at %d baud", UART_BAUD_RATE);
 }
 
-void load_model_mmap() {
-    ESP_LOGI(TAG, "Mapping model partition...");
-    const esp_partition_t* part = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, "model");
-    if (!part) {
-        ESP_LOGE(TAG, "Model partition not found!");
+void load_model() {
+    Serial.printf("[Node %d] Locating model partition on flash...\n", NODE_ID);
+    model_part = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, "model");
+    if (!model_part) {
+        Serial.printf("[Node %d] ERROR: 'model' partition not found on flash!\n", NODE_ID);
         return;
     }
-    
-    const void* map_ptr;
-    esp_partition_mmap_handle_t map_handle;
-    esp_err_t err = esp_partition_mmap(part, 0, part->size, ESP_PARTITION_MMAP_DATA, &map_ptr, &map_handle);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to mmap model partition: %s", esp_err_to_name(err));
-        return;
-    }
-    
-    uint8_t* ptr = (uint8_t*)map_ptr;
-    memcpy(&config, ptr, sizeof(Config));
-    ptr += 256; // Skip header
-    
-    ESP_LOGI(TAG, "Config: dim=%d, hidden=%d, layers=%d, heads=%d, vocab=%d", 
-             config.dim, config.hidden_dim, config.n_layers, config.n_heads, config.vocab_size);
+
+    uint8_t header[256];
+    esp_partition_read(model_part, 0, header, sizeof(Config));
+    memcpy(&config, header, sizeof(Config));
+
+    Serial.printf("[Node %d] Model Config: dim=%d, hidden=%d, layers=%d, heads=%d, vocab=%d\n",
+                  NODE_ID, config.dim, config.hidden_dim, config.n_layers, config.n_heads, config.vocab_size);
 
     int head_size = config.dim / config.n_heads;
     int kv_dim = config.n_kv_heads * head_size;
-    
-    if (NODE_ID == 1) {
-        weights.token_embedding_scales = (float*)ptr; ptr += config.vocab_size * sizeof(float);
-        weights.token_embedding_table = (uint8_t*)ptr; ptr += (config.vocab_size * config.dim) / 2;
-    }
-    
-    for (int i = 0; i < config.n_layers; i++) {
-        layer_weights.rms_att_weight[i] = (float*)ptr; ptr += config.dim * sizeof(float);
-        layer_weights.wq_scales[i] = (float*)ptr; ptr += config.dim * sizeof(float);
-        layer_weights.wq[i] = (uint8_t*)ptr; ptr += (config.dim * config.dim) / 2;
-        
-        layer_weights.wk_scales[i] = (float*)ptr; ptr += kv_dim * sizeof(float);
-        layer_weights.wk[i] = (uint8_t*)ptr; ptr += (kv_dim * config.dim) / 2;
-        
-        layer_weights.wv_scales[i] = (float*)ptr; ptr += kv_dim * sizeof(float);
-        layer_weights.wv[i] = (uint8_t*)ptr; ptr += (kv_dim * config.dim) / 2;
-        
-        layer_weights.wo_scales[i] = (float*)ptr; ptr += config.dim * sizeof(float);
-        layer_weights.wo[i] = (uint8_t*)ptr; ptr += (config.dim * config.dim) / 2;
-        
-        layer_weights.rms_ffn_weight[i] = (float*)ptr; ptr += config.dim * sizeof(float);
-        
-        layer_weights.w1_scales[i] = (float*)ptr; ptr += config.hidden_dim * sizeof(float);
-        layer_weights.w1[i] = (uint8_t*)ptr; ptr += (config.hidden_dim * config.dim) / 2;
-        
-        layer_weights.w2_scales[i] = (float*)ptr; ptr += config.dim * sizeof(float);
-        layer_weights.w2[i] = (uint8_t*)ptr; ptr += (config.dim * config.hidden_dim) / 2;
-        
-        layer_weights.w3_scales[i] = (float*)ptr; ptr += config.hidden_dim * sizeof(float);
-        layer_weights.w3[i] = (uint8_t*)ptr; ptr += (config.hidden_dim * config.dim) / 2;
-    }
-    
-    if (NODE_ID == 3) {
-        weights.rms_final_weight = (float*)ptr; ptr += config.dim * sizeof(float);
-        weights.wcls_scales = (float*)ptr; ptr += config.vocab_size * sizeof(float);
-        weights.wcls = (uint8_t*)ptr; ptr += (config.vocab_size * config.dim) / 2;
-    }
-    
-    weights.freq_cis_real = (float*)ptr; ptr += config.seq_len * (head_size / 2) * sizeof(float);
-    weights.freq_cis_imag = (float*)ptr; ptr += config.seq_len * (head_size / 2) * sizeof(float);
+    size_t offset = 256;
 
-    activation_vector = (float*)heap_caps_malloc(config.dim * sizeof(float), MALLOC_CAP_8BIT);
-    xb = (float*)heap_caps_malloc(config.dim * sizeof(float), MALLOC_CAP_8BIT);
-    xb2 = (float*)heap_caps_malloc(config.dim * sizeof(float), MALLOC_CAP_8BIT);
-    hb = (float*)heap_caps_malloc(config.hidden_dim * sizeof(float), MALLOC_CAP_8BIT);
-    hb2 = (float*)heap_caps_malloc(config.hidden_dim * sizeof(float), MALLOC_CAP_8BIT);
-    q = (float*)heap_caps_malloc(config.dim * sizeof(float), MALLOC_CAP_8BIT);
-    k = (float*)heap_caps_malloc(config.dim * sizeof(float), MALLOC_CAP_8BIT);
-    v = (float*)heap_caps_malloc(config.dim * sizeof(float), MALLOC_CAP_8BIT);
+    if (NODE_ID == 1) {
+        size_t tok_emb_size = config.vocab_size * sizeof(float) + (config.vocab_size * config.dim) / 2;
+        weights.token_embedding_scales = (float*)heap_caps_malloc(tok_emb_size, MALLOC_CAP_SPIRAM);
+        weights.token_embedding_table = (uint8_t*)(weights.token_embedding_scales + config.vocab_size);
+        esp_partition_read(model_part, offset, weights.token_embedding_scales, tok_emb_size);
+        offset += tok_emb_size;
+    }
+
+    layer_size = config.dim * sizeof(float)
+               + 4 * (config.dim * sizeof(float) + (config.dim * config.dim) / 2)
+               + config.dim * sizeof(float)
+               + 2 * (config.hidden_dim * sizeof(float) + (config.hidden_dim * config.dim) / 2)
+               + (config.dim * sizeof(float) + (config.dim * config.hidden_dim) / 2);
+
+    for (int l = 0; l < config.n_layers; l++) {
+        layer_flash_offsets[l] = offset;
+        offset += layer_size;
+    }
+
+    if (NODE_ID == 3) {
+        size_t rms_final_size = config.dim * sizeof(float);
+        weights.rms_final_weight = (float*)heap_caps_malloc(rms_final_size, MALLOC_CAP_SPIRAM);
+        esp_partition_read(model_part, offset, weights.rms_final_weight, rms_final_size);
+        offset += rms_final_size;
+
+        size_t wcls_size = config.vocab_size * sizeof(float) + (config.vocab_size * config.dim) / 2;
+        weights.wcls_scales = (float*)heap_caps_malloc(wcls_size, MALLOC_CAP_SPIRAM);
+        weights.wcls = (uint8_t*)(weights.wcls_scales + config.vocab_size);
+        esp_partition_read(model_part, offset, weights.wcls_scales, wcls_size);
+        offset += wcls_size;
+    }
+
+    size_t freq_size = config.seq_len * (head_size / 2) * sizeof(float);
+    weights.freq_cis_real = (float*)heap_caps_malloc(freq_size, MALLOC_CAP_SPIRAM);
+    esp_partition_read(model_part, offset, weights.freq_cis_real, freq_size);
+    offset += freq_size;
+
+    weights.freq_cis_imag = (float*)heap_caps_malloc(freq_size, MALLOC_CAP_SPIRAM);
+    esp_partition_read(model_part, offset, weights.freq_cis_imag, freq_size);
+
+    layer_cache = (uint8_t*)heap_caps_malloc(layer_size, MALLOC_CAP_SPIRAM);
+    activation_vector = (float*)heap_caps_malloc(config.dim * sizeof(float), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    xb = (float*)heap_caps_malloc(config.dim * sizeof(float), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    xb2 = (float*)heap_caps_malloc(config.dim * sizeof(float), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    hb = (float*)heap_caps_malloc(config.hidden_dim * sizeof(float), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    hb2 = (float*)heap_caps_malloc(config.hidden_dim * sizeof(float), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    q = (float*)heap_caps_malloc(config.dim * sizeof(float), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    k = (float*)heap_caps_malloc(config.dim * sizeof(float), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    v = (float*)heap_caps_malloc(config.dim * sizeof(float), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     xq_buffer = (int8_t*)heap_caps_malloc((config.hidden_dim > config.dim ? config.hidden_dim : config.dim), MALLOC_CAP_8BIT);
-    
-    ESP_LOGI(TAG, "Model mapped successfully!");
+
+    size_t kv_cache_size = config.n_layers * MAX_SEQ_LEN * kv_dim * sizeof(float);
+    key_cache = (float*)heap_caps_malloc(kv_cache_size, MALLOC_CAP_SPIRAM);
+    value_cache = (float*)heap_caps_malloc(kv_cache_size, MALLOC_CAP_SPIRAM);
+    att_buffer = (float*)heap_caps_malloc(config.n_heads * MAX_SEQ_LEN * sizeof(float), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+
+    Serial.printf("[Node %d] Weights & KV Cache loaded into PSRAM! Free PSRAM: %d KB\n",
+                  NODE_ID, heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024);
+}
+
+void load_layer(int l) {
+    esp_partition_read(model_part, layer_flash_offsets[l], layer_cache, layer_size);
+    uint8_t* ptr = layer_cache;
+    int head_size = config.dim / config.n_heads;
+    int kv_dim = config.n_kv_heads * head_size;
+
+    cur_layer.rms_att_weight = (float*)ptr; ptr += config.dim * sizeof(float);
+    cur_layer.wq_scales = (float*)ptr; ptr += config.dim * sizeof(float);
+    cur_layer.wq = (uint8_t*)ptr; ptr += (config.dim * config.dim) / 2;
+    cur_layer.wk_scales = (float*)ptr; ptr += kv_dim * sizeof(float);
+    cur_layer.wk = (uint8_t*)ptr; ptr += (kv_dim * config.dim) / 2;
+    cur_layer.wv_scales = (float*)ptr; ptr += kv_dim * sizeof(float);
+    cur_layer.wv = (uint8_t*)ptr; ptr += (kv_dim * config.dim) / 2;
+    cur_layer.wo_scales = (float*)ptr; ptr += config.dim * sizeof(float);
+    cur_layer.wo = (uint8_t*)ptr; ptr += (config.dim * config.dim) / 2;
+
+    cur_layer.rms_ffn_weight = (float*)ptr; ptr += config.dim * sizeof(float);
+    cur_layer.w1_scales = (float*)ptr; ptr += config.hidden_dim * sizeof(float);
+    cur_layer.w1 = (uint8_t*)ptr; ptr += (config.hidden_dim * config.dim) / 2;
+    cur_layer.w2_scales = (float*)ptr; ptr += config.dim * sizeof(float);
+    cur_layer.w2 = (uint8_t*)ptr; ptr += (config.dim * config.hidden_dim) / 2;
+    cur_layer.w3_scales = (float*)ptr; ptr += config.hidden_dim * sizeof(float);
+    cur_layer.w3 = (uint8_t*)ptr; ptr += (config.hidden_dim * config.dim) / 2;
 }
 
 void rmsnorm(float* o, float* x, float* weight, int size) {
     float ss = 0.0f;
-    for (int j = 0; j < size; j++) {
-        ss += x[j] * x[j];
-    }
+    for (int j = 0; j < size; j++) ss += x[j] * x[j];
     ss /= size;
     ss += 1e-5f;
     ss = 1.0f / sqrtf(ss);
-    for (int j = 0; j < size; j++) {
-        o[j] = weight[j] * (ss * x[j]);
-    }
+    for (int j = 0; j < size; j++) o[j] = weight[j] * (ss * x[j]);
 }
 
 void matmul_q(float* xout, float* x, uint8_t* w_packed, float* scales, int n, int d) {
     float max_val = 0.0f;
-    for(int i=0; i<n; i++) {
+    for (int i = 0; i < n; i++) {
         float f = fabsf(x[i]);
-        if(f > max_val) max_val = f;
+        if (f > max_val) max_val = f;
     }
     float x_scale = max_val / 127.0f;
     if (x_scale == 0.0f) x_scale = 1e-9f;
     float inv_x_scale = 1.0f / x_scale;
-    
-    for(int i=0; i<n; i++) {
+
+    for (int i = 0; i < n; i++) {
         xq_buffer[i] = (int8_t)roundf(x[i] * inv_x_scale);
     }
-    
+
     for (int i = 0; i < d; i++) {
         int32_t val = 0;
-        int idx = i * (n / 2); // each row has n/2 packed bytes
+        int idx = i * (n / 2);
         for (int j = 0; j < (n / 2); j++) {
             uint8_t packed = w_packed[idx + j];
             int8_t w0 = (packed & 0x0F) - 7;
             int8_t w1 = ((packed >> 4) & 0x0F) - 7;
-            
-            val += w0 * xq_buffer[j*2];
-            val += w1 * xq_buffer[j*2 + 1];
+            val += w0 * xq_buffer[j * 2];
+            val += w1 * xq_buffer[j * 2 + 1];
         }
         xout[i] = ((float)val) * (scales[i] * x_scale);
     }
 }
 
+static void softmax_f(float* x, int size) {
+    float max_val = x[0];
+    for (int i = 1; i < size; i++) {
+        if (x[i] > max_val) max_val = x[i];
+    }
+    float sum = 0.0f;
+    for (int i = 0; i < size; i++) {
+        x[i] = expf(x[i] - max_val);
+        sum += x[i];
+    }
+    float inv_sum = (sum > 0.0f) ? (1.0f / sum) : 0.0f;
+    for (int i = 0; i < size; i++) {
+        x[i] *= inv_sum;
+    }
+}
+
 void compute_layers(float* x, int pos) {
+    if (pos >= MAX_SEQ_LEN) pos = MAX_SEQ_LEN - 1;
     int dim = config.dim;
     int hidden_dim = config.hidden_dim;
     int head_size = dim / config.n_heads;
     int kv_dim = config.n_kv_heads * head_size;
     int kv_mul = config.n_heads / config.n_kv_heads;
-    
+
     for (int l = 0; l < config.n_layers; l++) {
-        rmsnorm(xb, x, layer_weights.rms_att_weight[l], dim);
-        
-        matmul_q(q, xb, layer_weights.wq[l], layer_weights.wq_scales[l], dim, dim);
-        matmul_q(k, xb, layer_weights.wk[l], layer_weights.wk_scales[l], dim, kv_dim);
-        matmul_q(v, xb, layer_weights.wv[l], layer_weights.wv_scales[l], dim, kv_dim);
-        
-        // RoPE
-        for (int i = 0; i < dim; i+=2) {
-            float q0 = q[i]; float q1 = q[i+1];
+        load_layer(l);
+
+        rmsnorm(xb, x, cur_layer.rms_att_weight, dim);
+
+        int loff = l * MAX_SEQ_LEN * kv_dim;
+        float* k_dest = key_cache + loff + pos * kv_dim;
+        float* v_dest = value_cache + loff + pos * kv_dim;
+
+        matmul_q(q, xb, cur_layer.wq, cur_layer.wq_scales, dim, dim);
+        matmul_q(k_dest, xb, cur_layer.wk, cur_layer.wk_scales, dim, kv_dim);
+        matmul_q(v_dest, xb, cur_layer.wv, cur_layer.wv_scales, dim, kv_dim);
+
+        // RoPE on q and k_dest
+        for (int i = 0; i < dim; i += 2) {
             float fcr = weights.freq_cis_real[pos * (head_size / 2) + (i % head_size) / 2];
             float fci = weights.freq_cis_imag[pos * (head_size / 2) + (i % head_size) / 2];
-            q[i]   = q0 * fcr - q1 * fci;
-            q[i+1] = q0 * fci + q1 * fcr;
+            float q0 = q[i]; float q1 = q[i + 1];
+            q[i]     = q0 * fcr - q1 * fci;
+            q[i + 1] = q0 * fci + q1 * fcr;
+            if (i < kv_dim) {
+                float k0 = k_dest[i]; float k1 = k_dest[i + 1];
+                k_dest[i]     = k0 * fcr - k1 * fci;
+                k_dest[i + 1] = k0 * fci + k1 * fcr;
+            }
         }
-        for (int i = 0; i < kv_dim; i+=2) {
-            float k0 = k[i]; float k1 = k[i+1];
-            float fcr = weights.freq_cis_real[pos * (head_size / 2) + (i % head_size) / 2];
-            float fci = weights.freq_cis_imag[pos * (head_size / 2) + (i % head_size) / 2];
-            k[i]   = k0 * fcr - k1 * fci;
-            k[i+1] = k0 * fci + k1 * fcr;
-        }
-        
-        // Simplified Attention
+
+        // Multihead attention across all timesteps 0..pos
         for (int h = 0; h < config.n_heads; h++) {
             float* q_head = q + h * head_size;
-            float* k_head = k + (h / kv_mul) * head_size;
-            float* v_head = v + (h / kv_mul) * head_size;
-            float score = 0.0f;
-            for (int i = 0; i < head_size; i++) {
-                score += q_head[i] * k_head[i];
+            float* att_head = att_buffer + h * MAX_SEQ_LEN;
+
+            for (int t = 0; t <= pos; t++) {
+                float* k_t = key_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
+                float score = 0.0f;
+                for (int i = 0; i < head_size; i++) {
+                    score += q_head[i] * k_t[i];
+                }
+                score /= sqrtf((float)head_size);
+                att_head[t] = score;
             }
-            score /= sqrtf((float)head_size);
-            float val = 1.0f; // Softmax for 1 token is 1.0
-            for (int i = 0; i < head_size; i++) {
-                xb2[h * head_size + i] = val * v_head[i];
+
+            softmax_f(att_head, pos + 1);
+
+            float* xb_head = xb2 + h * head_size;
+            memset(xb_head, 0, head_size * sizeof(float));
+            for (int t = 0; t <= pos; t++) {
+                float* v_t = value_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
+                float a = att_head[t];
+                for (int i = 0; i < head_size; i++) {
+                    xb_head[i] += a * v_t[i];
+                }
             }
         }
-        
-        matmul_q(xb, xb2, layer_weights.wo[l], layer_weights.wo_scales[l], dim, dim);
+
+        matmul_q(xb, xb2, cur_layer.wo, cur_layer.wo_scales, dim, dim);
         for (int i = 0; i < dim; i++) x[i] += xb[i];
-        
-        rmsnorm(xb, x, layer_weights.rms_ffn_weight[l], dim);
-        
-        matmul_q(hb, xb, layer_weights.w1[l], layer_weights.w1_scales[l], dim, hidden_dim);
-        matmul_q(hb2, xb, layer_weights.w3[l], layer_weights.w3_scales[l], dim, hidden_dim);
-        
+
+        rmsnorm(xb, x, cur_layer.rms_ffn_weight, dim);
+
+        matmul_q(hb, xb, cur_layer.w1, cur_layer.w1_scales, dim, hidden_dim);
+        matmul_q(hb2, xb, cur_layer.w3, cur_layer.w3_scales, dim, hidden_dim);
+
         for (int i = 0; i < hidden_dim; i++) {
             float val = hb[i];
-            val *= (1.0f / (1.0f + expf(-val))); // silu
+            val *= (1.0f / (1.0f + expf(-val)));
             val *= hb2[i];
             hb[i] = val;
         }
-        
-        matmul_q(xb, hb, layer_weights.w2[l], layer_weights.w2_scales[l], hidden_dim, dim);
+
+        matmul_q(xb, hb, cur_layer.w2, cur_layer.w2_scales, hidden_dim, dim);
         for (int i = 0; i < dim; i++) x[i] += xb[i];
+
+        vTaskDelay(pdMS_TO_TICKS(1));
     }
 }
 
+// ========================================================
+// Bulletproof Ring Packet Protocol with Sequence Position
+// ========================================================
+#define MAGIC_0 0xA5
+#define MAGIC_1 0x5A
+
+#define PKT_PING       0x01
+#define PKT_ACTIVATION 0x02
+#define PKT_TOKEN      0x03
+
+static void send_packet(uint8_t type, uint8_t pos, const uint8_t* payload, uint16_t len) {
+    uint8_t header[6] = {
+        MAGIC_0,
+        MAGIC_1,
+        type,
+        pos,
+        (uint8_t)(len >> 8),
+        (uint8_t)(len & 0xFF)
+    };
+    uart_write_bytes(UART_NUM, (const char*)header, 6);
+    if (len > 0 && payload != NULL) {
+        uart_write_bytes(UART_NUM, (const char*)payload, len);
+    }
+}
+
+static bool receive_packet(uint8_t* type, uint8_t* pos, uint8_t* payload, uint16_t max_len, uint16_t* out_len, uint32_t timeout_ms) {
+    TickType_t start = xTaskGetTickCount();
+    TickType_t max_ticks = pdMS_TO_TICKS(timeout_ms);
+
+    // 1. Sync on MAGIC_0 and MAGIC_1
+    uint8_t b = 0;
+    while (1) {
+        if ((xTaskGetTickCount() - start) > max_ticks) return false;
+        int n = uart_read_bytes(UART_NUM, &b, 1, pdMS_TO_TICKS(20));
+        if (n <= 0) {
+            vTaskDelay(pdMS_TO_TICKS(2));
+            continue;
+        }
+        if (b == MAGIC_0) {
+            n = uart_read_bytes(UART_NUM, &b, 1, pdMS_TO_TICKS(50));
+            if (n > 0 && b == MAGIC_1) {
+                break;
+            }
+        }
+    }
+
+    // 2. Read type, pos, and payload length (4 bytes)
+    uint8_t meta[4];
+    int meta_read = 0;
+    while (meta_read < 4) {
+        if ((xTaskGetTickCount() - start) > max_ticks) return false;
+        int n = uart_read_bytes(UART_NUM, meta + meta_read, 4 - meta_read, pdMS_TO_TICKS(50));
+        if (n > 0) meta_read += n;
+        else vTaskDelay(pdMS_TO_TICKS(2));
+    }
+
+    *type = meta[0];
+    if (pos) *pos = meta[1];
+    uint16_t payload_len = ((uint16_t)meta[2] << 8) | meta[3];
+    if (out_len) *out_len = payload_len;
+
+    if (payload_len > max_len) {
+        return false;
+    }
+
+    // 3. Read exact payload
+    uint16_t payload_read = 0;
+    while (payload_read < payload_len) {
+        if ((xTaskGetTickCount() - start) > max_ticks) return false;
+        int n = uart_read_bytes(UART_NUM, payload + payload_read, payload_len - payload_read, pdMS_TO_TICKS(50));
+        if (n > 0) payload_read += n;
+        else vTaskDelay(pdMS_TO_TICKS(2));
+    }
+
+    return true;
+}
+
 #if NODE_ID == 1
+#include "vocab.h"
+
+static bool ping_ring() {
+    uart_flush_input(UART_NUM);
+    send_packet(PKT_PING, 0, NULL, 0);
+
+    uint8_t rx_type = 0;
+    uint8_t rx_pos = 0;
+    uint16_t rx_len = 0;
+    uint8_t dummy[16];
+    bool ok = receive_packet(&rx_type, &rx_pos, dummy, sizeof(dummy), &rx_len, 2000);
+    return (ok && rx_type == PKT_PING);
+}
+
 void head_node_task(void *pvParameters) {
-    ESP_LOGI(TAG, "--- NODE 1 (HEAD) ONLINE ---");
-    int pos = 0;
-    int token_id = 1; 
-    int vector_bytes = config.dim * sizeof(float);
-    
-    while(1) {
+    Serial.println("\n========================================================");
+    Serial.println("     ESP32-S3 CLUSTER STARTUP BUFFER (15 SECONDS)");
+    Serial.println("========================================================");
+    Serial.println("[Node 1] Giving Node 2 & Node 3 time to power on and boot...");
+    Serial.println("[Node 1] (Press ENTER in Serial Monitor anytime to skip wait)\n");
+
+    for (int sec = 15; sec > 0; sec--) {
+        if (Serial.available()) {
+            Serial.readStringUntil('\n');
+            Serial.println("[Node 1] Buffer skipped by user!");
+            break;
+        }
+        Serial.printf("[Node 1] Checking cluster ring in %d seconds...\n", sec);
         vTaskDelay(pdMS_TO_TICKS(1000));
-        
-        float scale = weights.token_embedding_scales[token_id];
-        uint8_t* row = weights.token_embedding_table + token_id * (config.dim / 2);
-        for(int i=0; i < (config.dim / 2); i++) {
-            uint8_t packed = row[i];
-            int8_t w0 = (packed & 0x0F) - 7;
-            int8_t w1 = ((packed >> 4) & 0x0F) - 7;
-            activation_vector[i*2] = ((float)w0) * scale;
-            activation_vector[i*2 + 1] = ((float)w1) * scale;
+    }
+
+    bool ring_synced = false;
+    Serial.println("\n[Node 1] Testing ring link (Node 1 -> Node 2 -> Node 3 -> Node 1)...");
+    for (int attempt = 1; attempt <= 5; attempt++) {
+        Serial.printf("[Node 1] Pinging ring (Attempt %d/5)... ", attempt);
+        if (ping_ring()) {
+            ring_synced = true;
+            Serial.println("PASSED!");
+            break;
+        } else {
+            Serial.println("no response yet.");
         }
-        
-        compute_layers(activation_vector, pos);
-        uart_write_bytes(UART_NUM, (const char*)activation_vector, vector_bytes);
-        
-        int next_token_id = -1;
-        int len = uart_read_bytes(UART_NUM, &next_token_id, sizeof(int), portMAX_DELAY);
-        
-        if (len == sizeof(int)) {
-            ESP_LOGI(TAG, "[Node 1] Sampled Token ID: %d", next_token_id);
-            token_id = next_token_id;
-            pos++;
-            if (pos >= config.seq_len) pos = 0;
+        vTaskDelay(pdMS_TO_TICKS(1500));
+    }
+
+    if (ring_synced) {
+        Serial.println("\n========================================================");
+        Serial.println("  [+] SUCCESS: ALL 3 ESP32-S3 NODES LINKED IN THE RING! ");
+        Serial.println("========================================================");
+        Serial.println("Ring pipeline: Node 1 -> Node 2 -> Node 3 -> Node 1 is ACTIVE.");
+    } else {
+        Serial.println("\n========================================================");
+        Serial.println("  [!] NOTICE: Ring ping check timed out.");
+        Serial.println("========================================================");
+        Serial.println("  - Check that Node 2 & Node 3 are powered on 5V and GND.");
+        Serial.println("  - Check UART ring: Node 1 TX (17) -> Node 2 RX (18)");
+        Serial.println("                     Node 2 TX (17) -> Node 3 RX (18)");
+        Serial.println("                     Node 3 TX (17) -> Node 1 RX (18)");
+        Serial.println("  - You can type 'ping' in Serial Monitor at any time to re-test!\n");
+    }
+
+    Serial.println("\n========================================================");
+    Serial.println("     CHEF GORDON RAMSAY ESP32-S3 CLUSTER READY!         ");
+    Serial.println("========================================================");
+    Serial.println("How to use: Type an error into Serial Monitor & hit ENTER.");
+    Serial.println("Examples:   'NullPointerException' or 'SyntaxError' or 'ping'");
+    Serial.println("Or simply hit ENTER for an instant Gordon Ramsay roast!");
+    Serial.print("\n> ");
+
+    int vector_bytes = config.dim * sizeof(float);
+    int prompt_tokens[48];
+
+    while(1) {
+        if (Serial.available()) {
+            String user_input = Serial.readStringUntil('\n');
+            user_input.trim();
+            if (user_input.equalsIgnoreCase("ping")) {
+                Serial.println("\n[Node 1] Re-testing cluster ring connectivity...");
+                if (ping_ring()) {
+                    ring_synced = true;
+                    Serial.println("[+] Ring test PASSED! All 3 nodes responding.");
+                } else {
+                    Serial.println("[-] Ring test failed. Check wires and power.");
+                }
+                Serial.print("\n> ");
+                continue;
+            }
+
+            if (user_input.length() == 0) {
+                user_input = "SyntaxError: unexpected EOF while parsing";
+            }
+            Serial.printf("\n[User Error]: \"%s\"\n", user_input.c_str());
+
+            // Build the exact prompt format from training
+            String prompt_str = "<User>: IDE Error:\n" + user_input + "\n<Gordon>:";
+            int num_prompt_tokens = tokenize_prompt(prompt_str.c_str(), prompt_tokens, 48);
+
+            Serial.print("[Chef Gordon Ramsay]: ");
+
+            int pos = 0;
+            int token_id = 0;
+            bool success = true;
+
+            // 1. Ingest prompt tokens quietly into the KV cache across all nodes
+            for (int p = 0; p < num_prompt_tokens; p++) {
+                token_id = prompt_tokens[p];
+
+                float scale = weights.token_embedding_scales[token_id];
+                uint8_t* row = weights.token_embedding_table + token_id * (config.dim / 2);
+                for (int i = 0; i < (config.dim / 2); i++) {
+                    uint8_t packed = row[i];
+                    int8_t w0 = (packed & 0x0F) - 7;
+                    int8_t w1 = ((packed >> 4) & 0x0F) - 7;
+                    activation_vector[i * 2]     = ((float)w0) * scale;
+                    activation_vector[i * 2 + 1] = ((float)w1) * scale;
+                }
+
+                compute_layers(activation_vector, p);
+                send_packet(PKT_ACTIVATION, (uint8_t)p, (const uint8_t*)activation_vector, vector_bytes);
+
+                uint8_t rx_type = 0;
+                uint8_t rx_pos = 0;
+                uint16_t rx_len = 0;
+                int next_tok = -1;
+                bool ok = receive_packet(&rx_type, &rx_pos, (uint8_t*)&next_tok, sizeof(int), &rx_len, 8000);
+
+                if (!ok || rx_type != PKT_TOKEN) {
+                    Serial.println("\n[!] Pipeline timeout waiting for cluster response.");
+                    Serial.println("    Type 'ping' to verify ring wiring.");
+                    success = false;
+                    break;
+                }
+                token_id = next_tok;
+            }
+
+            pos = num_prompt_tokens;
+
+            // 2. Stream Gordon's response tokens
+            if (success) {
+                for (int gen = 0; gen < 25; gen++) {
+                    if (is_stop_token(token_id)) break;
+
+                    print_token(token_id);
+
+                    // End roast if sentence ends on ! or ? after generating a few words
+                    const char* tstr = VOCAB_TABLE[token_id];
+                    if (gen >= 5 && (strchr(tstr, '!') != NULL || strchr(tstr, '?') != NULL)) {
+                        break;
+                    }
+
+                    float scale = weights.token_embedding_scales[token_id];
+                    uint8_t* row = weights.token_embedding_table + token_id * (config.dim / 2);
+                    for (int i = 0; i < (config.dim / 2); i++) {
+                        uint8_t packed = row[i];
+                        int8_t w0 = (packed & 0x0F) - 7;
+                        int8_t w1 = ((packed >> 4) & 0x0F) - 7;
+                        activation_vector[i * 2]     = ((float)w0) * scale;
+                        activation_vector[i * 2 + 1] = ((float)w1) * scale;
+                    }
+
+                    compute_layers(activation_vector, pos);
+                    send_packet(PKT_ACTIVATION, (uint8_t)pos, (const uint8_t*)activation_vector, vector_bytes);
+
+                    uint8_t rx_type = 0;
+                    uint8_t rx_pos = 0;
+                    uint16_t rx_len = 0;
+                    int next_tok = -1;
+                    bool ok = receive_packet(&rx_type, &rx_pos, (uint8_t*)&next_tok, sizeof(int), &rx_len, 8000);
+
+                    if (!ok || rx_type != PKT_TOKEN) {
+                        Serial.println("\n[!] Generation halted: Node 3 response timeout.");
+                        break;
+                    }
+
+                    token_id = next_tok;
+                    pos++;
+                    if (pos >= MAX_SEQ_LEN) break;
+                }
+            }
+
+            Serial.println("\n\nType next error (or press ENTER to roast again):");
+            Serial.print("> ");
         }
+
+        vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
 
 #elif NODE_ID == 2
 void body_node_task(void *pvParameters) {
-    ESP_LOGI(TAG, "--- NODE 2 (BODY) ONLINE ---");
+    uart_flush_input(UART_NUM);
+    Serial.println("[Node 2] Online! Listening for ring packets...");
     int vector_bytes = config.dim * sizeof(float);
-    int pos = 0;
-    
+
+    uint8_t rx_type = 0;
+    uint8_t rx_pos = 0;
+    uint16_t rx_len = 0;
+
     while(1) {
-        int len = uart_read_bytes(UART_NUM, activation_vector, vector_bytes, portMAX_DELAY);
-        if (len == vector_bytes) {
-            compute_layers(activation_vector, pos);
-            uart_write_bytes(UART_NUM, (const char*)activation_vector, vector_bytes);
-            pos++;
-            if (pos >= config.seq_len) pos = 0;
+        bool ok = receive_packet(&rx_type, &rx_pos, (uint8_t*)activation_vector, vector_bytes, &rx_len, 5000);
+        if (!ok) {
+            continue;
+        }
+
+        if (rx_type == PKT_PING) {
+            send_packet(PKT_PING, 0, NULL, 0);
+            Serial.println("[Node 2] Cluster ping received & forwarded to Node 3!");
+            continue;
+        }
+
+        if (rx_type == PKT_ACTIVATION && rx_len == vector_bytes) {
+            compute_layers(activation_vector, rx_pos);
+            send_packet(PKT_ACTIVATION, rx_pos, (const uint8_t*)activation_vector, vector_bytes);
         }
     }
 }
 
 #elif NODE_ID == 3
-void tail_node_task(void *pvParameters) {
-    ESP_LOGI(TAG, "--- NODE 3 (TAIL) ONLINE ---");
-    int vector_bytes = config.dim * sizeof(float);
-    int pos = 0;
-    
-    float* logits = (float*)heap_caps_malloc(config.vocab_size * sizeof(float), MALLOC_CAP_8BIT);
-    
-    while(1) {
-        int len = uart_read_bytes(UART_NUM, activation_vector, vector_bytes, portMAX_DELAY);
-        if (len == vector_bytes) {
-            compute_layers(activation_vector, pos);
-            rmsnorm(activation_vector, activation_vector, weights.rms_final_weight, config.dim);
-            
-            matmul_q(logits, activation_vector, weights.wcls, weights.wcls_scales, config.dim, config.vocab_size);
-            
-            int next_token_id = 0;
-            float max_val = logits[0];
-            for(int i=1; i < config.vocab_size; i++) {
-                if (logits[i] > max_val) {
-                    max_val = logits[i];
-                    next_token_id = i;
-                }
+static int sample_token_t(float* logits, int vocab_size, float temp) {
+    logits[0] = -1e9f; // Never output <unk>
+
+    if (temp <= 0.05f) {
+        int best = 1;
+        float max_v = logits[1];
+        for (int i = 2; i < vocab_size; i++) {
+            if (logits[i] > max_v) {
+                max_v = logits[i];
+                best = i;
             }
-            
-            ESP_LOGI(TAG, "[Node 3] Sampled token ID %d", next_token_id);
-            uart_write_bytes(UART_NUM, (const char*)&next_token_id, sizeof(int));
-            pos++;
-            if (pos >= config.seq_len) pos = 0;
+        }
+        return best;
+    }
+
+    float max_v = logits[1];
+    for (int i = 2; i < vocab_size; i++) {
+        if (logits[i] > max_v) max_v = logits[i];
+    }
+    float sum = 0.0f;
+    for (int i = 1; i < vocab_size; i++) {
+        logits[i] = expf((logits[i] - max_v) / temp);
+        sum += logits[i];
+    }
+    float r = ((float)rand() / (float)RAND_MAX) * sum;
+    float acc = 0.0f;
+    for (int i = 1; i < vocab_size; i++) {
+        acc += logits[i];
+        if (acc >= r) return i;
+    }
+    return vocab_size - 1;
+}
+
+void tail_node_task(void *pvParameters) {
+    uart_flush_input(UART_NUM);
+    Serial.println("[Node 3] Online! Listening for ring packets...");
+    int vector_bytes = config.dim * sizeof(float);
+    float* logits = (float*)heap_caps_malloc(config.vocab_size * sizeof(float), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+
+    uint8_t rx_type = 0;
+    uint8_t rx_pos = 0;
+    uint16_t rx_len = 0;
+
+    while(1) {
+        bool ok = receive_packet(&rx_type, &rx_pos, (uint8_t*)activation_vector, vector_bytes, &rx_len, 5000);
+        if (!ok) {
+            continue;
+        }
+
+        if (rx_type == PKT_PING) {
+            send_packet(PKT_PING, 0, NULL, 0);
+            Serial.println("[Node 3] Cluster ping received & forwarded to Node 1!");
+            continue;
+        }
+
+        if (rx_type == PKT_ACTIVATION && rx_len == vector_bytes) {
+            compute_layers(activation_vector, rx_pos);
+            rmsnorm(activation_vector, activation_vector, weights.rms_final_weight, config.dim);
+            matmul_q(logits, activation_vector, weights.wcls, weights.wcls_scales, config.dim, config.vocab_size);
+
+            int next_token_id = sample_token_t(logits, config.vocab_size, 0.5f);
+
+            send_packet(PKT_TOKEN, rx_pos, (const uint8_t*)&next_token_id, sizeof(int));
         }
     }
 }
 #endif
 
-#ifdef ARDUINO
-#include <Arduino.h>
-void llm_main(void);
 void setup() {
-    llm_main();
-}
-void loop() {
-    vTaskDelay(pdMS_TO_TICKS(1000));
-}
-void llm_main(void) {
-#else
-extern "C" void app_main(void) {
-#endif
-    ESP_LOGI(TAG, "Chained Esp32S3 tiny LLM Cluster initializing...");
+    Serial.begin(115200);
+    delay(2000); // 2 second USB-CDC discovery delay
+
+    Serial.println("\n\n========================================================");
+    Serial.printf("     ESP32-S3 NODE %d INITIALIZING\n", NODE_ID);
+    Serial.println("========================================================");
+
     init_uart_ring();
-    load_model_mmap();
-    
+    load_model();
+
 #if NODE_ID == 1
     xTaskCreatePinnedToCore(head_node_task, "head_task", 8192, NULL, 5, NULL, 1);
 #elif NODE_ID == 2
     xTaskCreatePinnedToCore(body_node_task, "body_task", 8192, NULL, 5, NULL, 1);
 #elif NODE_ID == 3
     xTaskCreatePinnedToCore(tail_node_task, "tail_task", 8192, NULL, 5, NULL, 1);
-#else
-    #error "Invalid NODE_ID specified!"
 #endif
 }
 
+void loop() {
+    vTaskDelay(pdMS_TO_TICKS(1000));
+}

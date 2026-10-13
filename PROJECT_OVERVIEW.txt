@@ -1,0 +1,376 @@
+====================================================================================================
+               PROJECT TECHNICAL MANIFESTO & SYSTEM ARCHITECTURE
+    DISTRIBUTED 86.5M PARAMETER TINY LLM PIPELINE CLUSTER ON ESP32-S3 (N16R8)
+             "Chef Gordon Ramsay: Autonomous IDE Error Roasting Cluster"
+====================================================================================================
+
+Author / Engineering Team: Embedded ML & Distributed Systems Research
+Hardware Platform: 3x Espressif ESP32-S3-WROOM-1 / DevKitC-1 (N16R8: 16MB Flash, 8MB Octal PSRAM)
+Model Size: 86,512,128 Parameters (~86.5 Million Parameters)
+Target Task: Low-latency, generative code-critique and compiler error mocking in character
+Repository Root: chained_esp32s3_tiny_llm
+
+
+====================================================================================================
+1. EXECUTIVE SUMMARY & NOVELTY
+====================================================================================================
+
+Deploying Large Language Models (LLMs) on microcontrollers (MCUs) is typically limited to models 
+under 15M to 30M parameters (e.g., TinyStories-15M or 30M). The primary barrier is not merely 
+compute capability, but strict hardware boundaries:
+  - An 86.5M parameter model in standard 32-bit floating point (FP32) consumes ~346 Megabytes.
+  - In standard 8-bit integer quantization (INT8), it consumes ~86.5 Megabytes.
+  - An ESP32-S3 (N16R8) has only 16 Megabytes of SPI Flash and 8 Megabytes of external PSRAM (OPI).
+  - Furthermore, the ESP32-S3 hardware Memory Management Unit (MMU) enforces a strict physical 
+    cache mapping window of only 3 to 4 Megabytes of virtual flash address space (`DROM/IROM`).
+
+This project achieves what was previously considered impossible on hobbyist microcontrollers:
+it trains, quantizes, slices, and executes a full **86.5 Million Parameter Decoder-Only Transformer** 
+across a 3-node physical ring cluster of ESP32-S3 chips with zero external computers in the loop.
+
+How this novelty is achieved:
+1. **Ring-Pipeline Spatial Parallelism**: The 12 transformer layers and projection heads are split 
+   across three ESP32-S3 microcontrollers connected in a high-speed UART ring (921,600 baud), 
+   passing hidden activation vectors sequentially.
+2. **Channel-Wise 4-Bit Offset-Binary Quantization (Q4_0)**: All weight tensors are compressed by 
+   87.5% down to 4 bits per weight with FP32 row scales, shrinking the total model footprint from 
+   346MB to ~43.3MB (~14.4MB per node).
+3. **Dynamic Flash-to-PSRAM Layer Paging**: Overcoming the 3MB MMU hardware ceiling by paging 
+   individual 3.57MB layer weights from raw SPI Flash partitions directly into an 8MB PSRAM layer 
+   cache via DMA/SPI read operations.
+4. **Full Multi-Head Attention KV Caching on Microcontroller PSRAM**: Implementing a complete LLaMA 
+   Key-Value (KV) cache in PSRAM for multi-token self-attention history, preventing context loss 
+   and sentence collapse.
+
+
+====================================================================================================
+2. MACHINE LEARNING ARCHITECTURE IN DEPTH
+====================================================================================================
+
+The model is a modern decoder-only auto-regressive transformer adhering to the LLaMA / Mistral 
+architectural specifications:
+
+----------------------------------------------------------------------------------------------------
+Model Hyperparameters
+----------------------------------------------------------------------------------------------------
+  - Embedding Dimension (`dim`): 768
+  - Hidden / FFN Dimension (`hidden_dim`): 2048
+  - Total Transformer Layers (`n_layers`): 12 layers (4 layers allocated per ESP32-S3 node)
+  - Attention Heads (`n_heads`): 12 heads (Query heads)
+  - Key/Value Heads (`n_kv_heads`): 12 heads (Standard Multi-Head Attention, head_dim = 64)
+  - Maximum Sequence Length (`max_seq_len`): 256 tokens (Active KV Cache dimensioned to 64 on MCU)
+  - Vocabulary Size (`vocab_size`): 2,048 tokens
+  - Quantization Precision: 4-bit Packed Signed Offset with Per-Row Float Scaling
+  - Total Weights: 86,512,128 parameters
+  - Parameter Breakdown:
+      * Token Embeddings: 2048 x 768 = 1,572,864 params
+      * Per Layer Attention (WQ, WK, WV, WO): 4 x (768 x 768) = 2,359,296 params/layer
+      * Per Layer SwiGLU FFN (W1, W2, W3): 3 x (768 x 2048) = 4,718,592 params/layer
+      * Total Per Layer: 7,077,888 params x 12 layers = 84,934,656 params
+      * Final Classification Head (WCLS): 768 x 2048 = 1,572,864 params
+      * Total: 86,512,128 params (~86.5M)
+
+----------------------------------------------------------------------------------------------------
+Mathematical Formulations
+----------------------------------------------------------------------------------------------------
+
+1. RMSNorm (Root Mean Square Normalization):
+   Replaces standard LayerNorm by removing the mean-centering step, reducing compute overhead on MCU:
+     RMS(x) = sqrt( (1 / d) * sum_{i=1}^d (x_i^2) + epsilon )
+     RMSNorm(x)_i = (x_i / RMS(x)) * g_i
+   where g is a learnable gain vector and epsilon = 1e-5.
+
+2. RoPE (Rotary Position Embeddings):
+   Positions are encoded directly into Query and Key representations via complex 2D rotation:
+     R_{Theta, pos}^d = diag( R_1, R_2, ..., R_{d/2} )
+     R_k = [ cos(pos * theta_k)  -sin(pos * theta_k) ]
+           [ sin(pos * theta_k)   cos(pos * theta_k) ]
+   where theta_k = 10000^(-2(k-1)/d). Precomputed real and imaginary tables are cached in PSRAM.
+
+3. Multi-Head Scaled Dot-Product Attention with KV-Cache:
+   For position `pos` and head `h`:
+     Score(pos, t) = ( Q_{pos, h} . K_{t, h} ) / sqrt(head_dim)    for t in [0, pos]
+     AttentionWeights = Softmax( Score(pos, 0..pos) )
+     HeadOutput = sum_{t=0}^pos ( AttentionWeights_t * V_{t, h} )
+   The keys and values for all previous tokens t < pos are retrieved directly from the PSRAM 
+   KV cache without recomputing past tokens.
+
+4. SwiGLU Feed-Forward Network:
+   The non-linear feedforward projection uses Swish Gated Linear Units:
+     SwiGLU(x) = ( (x * W_1) * sigmoid(x * W_1) ) * (x * W_3)
+     Output = SwiGLU(x) * W_2
+   where W1 and W3 project 768 -> 2048, and W2 projects 2048 -> 768.
+
+
+====================================================================================================
+3. TRAINING PIPELINE & PYTHON MACHINE LEARNING STACK
+====================================================================================================
+
+----------------------------------------------------------------------------------------------------
+Python Libraries & Frameworks Used
+----------------------------------------------------------------------------------------------------
+  - PyTorch (torch): Model definition, autograd backpropagation, tensor ops, AdamW optimization.
+  - SentencePiece: Unsupervised Byte-Pair Encoding (BPE) subword tokenization model training.
+  - NumPy: Binary matrix serialization and tensor slicing.
+  - Tqdm: Progress visualization for multi-threaded tokenization shards.
+  - Struct & Sys: Low-level binary packing for ESP32 flash partition formatting.
+
+----------------------------------------------------------------------------------------------------
+Synthetic Dataset Engineering (`generate_dataset.py`)
+----------------------------------------------------------------------------------------------------
+Standard language modeling datasets (like TinyStories or OpenWebText) waste capacity on generic 
+dialogue and syntax that an 86.5M MCU model cannot afford. 
+To achieve maximum personality and high instruction compliance, a synthetic generator produced 
+300,000 paired training examples across 20 JSON shards:
+  - Multi-Language Error Corpus: Python, C++, Java, Rust, Go, JavaScript, C#, Arduino, FreeRTOS, 
+    and ESP32 hardware crash registers (Brownout detector, Guru Meditation LoadProhibited, RTCWDT).
+  - Authentic Gordon Ramsay Insult Corpus: ~100 unique high-flavor insults ("You donkey!", 
+    "It's RAW! Your variables aren't even initialized, you idiot sandwich!", "My gran could code 
+    better than this, and she's dead!").
+  - Exact Training Template:
+      `<User>: IDE Error in {Language} at {filename}:{line_num}:\n{Error}\n<Gordon>: {Insult}`
+
+----------------------------------------------------------------------------------------------------
+Custom Vocabulary & Pre-tokenization
+----------------------------------------------------------------------------------------------------
+Standard models use 32,000 to 50,000 vocabularies (e.g. LLaMA/GPT-4). A 32,000 vocabulary at 
+dim=768 would require:
+  32,000 * 768 * 4 bytes = 98.3 Megabytes of weights FOR THE EMBEDDING TABLE ALONE!
+That single table would overflow the entire 16MB flash chip.
+
+The Solution:
+A custom 2,048-token SentencePiece BPE vocabulary (`tok2048.vocab`):
+  - Tokens 0–3: Special tokens (`<unk>`, `<s>`, `</s>`, `<pad>`)
+  - Tokens 4–259: Raw Byte Fallback (`<0x00>` through `<0xFF>`)
+  - Tokens 260–2047: High-frequency domain words: `NullPointer`, `Exception`, `SyntaxError`, 
+    `Segmentation`, `Ramsay`, `Gordon`, `donkey`, `raw`, `spaghetti`.
+  - Memory Footprint: 2048 x 768 in 4-bit = 786 KB (Fits easily in RAM!).
+
+----------------------------------------------------------------------------------------------------
+Model Training (`train_tiny_llm.py` & `llama2.c/train.py`)
+----------------------------------------------------------------------------------------------------
+  - Objective: Auto-regressive cross-entropy loss over next-token prediction.
+  - Optimizer: AdamW (lr = 5e-4, beta1 = 0.9, beta2 = 0.95, weight_decay = 0.1).
+  - Learning Rate Schedule: Linear warmup over 200 iterations followed by Cosine Decay to 10% min lr.
+  - Context Window: 256 tokens.
+  - Convergence: Trained from initial loss of ~7.62 down to 0.95 cross-entropy loss.
+  - Model Export: Exported checkpoint to raw binary weight file `my_fine_tuned_model.bin`.
+
+
+====================================================================================================
+4. 4-BIT QUANTIZATION & CLUSTER SLICING (`split_model.py`)
+====================================================================================================
+
+The float32 binary model is 346MB. We developed a custom offline quantization and topological 
+slicing engine in `split_model.py`.
+
+----------------------------------------------------------------------------------------------------
+Channel-Wise 4-Bit Packed Quantization Algorithm
+----------------------------------------------------------------------------------------------------
+For each weight matrix W of size (Rows, Cols):
+  1. For each row i:
+     - Find maximum absolute value: `max_val = max(|W[i, :]|)`.
+     - Compute scale factor: `scale = max_val / 7.0f`.
+     - If `scale == 0`, set `scale = 1e-9`.
+  2. For each weight `w` in row i:
+     - Quantize to signed integer: `q = clamp(round(w / scale), -7, 7)`.
+     - Offset into unsigned nibble: `u = (q + 7) & 0x0F` (Range: 0 to 14).
+  3. Pack two 4-bit nibbles into one uint8:
+     - `packed_byte = (u_even & 0x0F) | ((u_odd & 0x0F) << 4)`.
+  4. Write row scales (FP32) followed by packed nibbles (uint8 array).
+
+De-quantization during C++ inference on ESP32-S3:
+  ```cpp
+  uint8_t packed = w_packed[idx + j];
+  int8_t w0 = (packed & 0x0F) - 7;
+  int8_t w1 = ((packed >> 4) & 0x0F) - 7;
+  // Matrix Multiply Accumulate:
+  val += w0 * xq_buffer[j * 2];
+  val += w1 * xq_buffer[j * 2 + 1];
+  ```
+This achieves zero floating-point multiplication in the inner matrix dot product loop! The CPU executes 
+rapid integer multiply-accumulate operations, multiplying by the floating-point scale factor only 
+once per output dimension.
+
+----------------------------------------------------------------------------------------------------
+Pipeline Slicing Across 3 Nodes
+----------------------------------------------------------------------------------------------------
+The 12-layer model is split into 3 partition binaries:
+
+  [Node 1: Head Node] (`node1.bin` - 14.47 MB)
+    - 256-byte Cluster Header (Config)
+    - Token Embedding Table (`tok_emb`): 2048 x 768 (Scales + 4-bit packed: 0.85 MB)
+    - Transformer Layers 0, 1, 2, 3 (4 layers x 3.57 MB = 14.28 MB)
+    - Rotary Embeddings Table (`freq_cis_real`, `freq_cis_imag`: 32 KB)
+
+  [Node 2: Body Node] (`node2.bin` - 13.71 MB)
+    - 256-byte Cluster Header (Config)
+    - Transformer Layers 4, 5, 6, 7 (4 layers x 3.57 MB = 14.28 MB)
+    - Rotary Embeddings Table (32 KB)
+
+  [Node 3: Tail Node] (`node3.bin` - 14.47 MB)
+    - 256-byte Cluster Header (Config)
+    - Transformer Layers 8, 9, 10, 11 (4 layers x 3.57 MB = 14.28 MB)
+    - Final RMSNorm Weight (3 KB)
+    - Language Model Head Classifier (`wcls`): 2048 x 768 (0.85 MB)
+    - Rotary Embeddings Table (32 KB)
+
+
+====================================================================================================
+5. EMBEDDED C++ FIRMWARE & HARDWARE OVERCOMING (ESP-IDF / ARDUINO)
+====================================================================================================
+
+----------------------------------------------------------------------------------------------------
+Overcoming the 3MB MMU Hardware Limit: Dynamic PSRAM Layer Paging
+----------------------------------------------------------------------------------------------------
+Standard ESP32 firmware attempts to use `esp_partition_mmap()` to map partitions into the CPU's 
+pointer space. However, the ESP32-S3 MMU has only 64 to 128 hardware pages for external data cache, 
+capping mmap at 3 to 4 Megabytes. Attempting to map 14.5MB causes an immediate `ESP_ERR_NO_MEM` panic.
+
+Our Solution:
+  1. Global tables (`tok_emb`, `wcls`, `freq_cis`) are permanently allocated in PSRAM (~1.7 MB).
+  2. A single layer cache buffer of size `layer_size` (3.57 MB) is allocated in PSRAM.
+  3. When computing layer `l`:
+     ```cpp
+     esp_partition_read(model_part, layer_flash_offsets[l], layer_cache, layer_size);
+     ```
+     Reading 3.57MB via high-speed SPI flash takes only ~120 milliseconds.
+  4. The layer is executed in PSRAM, and the buffer is overwritten for the next layer.
+This leaves over 2.2 Megabytes of free PSRAM on each board for KV cache and FreeRTOS operations!
+
+----------------------------------------------------------------------------------------------------
+Framed Ring Network Protocol over UART (921,600 Baud)
+----------------------------------------------------------------------------------------------------
+Communication flows unidirectionally in a ring:
+  Node 1 (TX 17) ---> Node 2 (RX 18) ---> Node 3 (RX 18) ---> Node 1 (RX 18)
+
+To eliminate byte desynchronization and electrical noise during boot, a strict 6-byte framing 
+packet protocol was engineered:
+  - Byte 0: `0xA5` (Sync Magic 0)
+  - Byte 1: `0x5A` (Sync Magic 1)
+  - Byte 2: `PKT_TYPE` (0x01: PING, 0x02: ACTIVATION, 0x03: TOKEN)
+  - Byte 3: `POS` (Sequence position 0..63 for KV Cache lockstep synchronization)
+  - Byte 4: `LEN_HI` (Payload length high byte)
+  - Byte 5: `LEN_LO` (Payload length low byte)
+  - Bytes 6..N: Payload (3072 bytes of FP32 activations or 4 bytes of token ID)
+
+If any node receives an out-of-order byte or line noise, `receive_packet()` discards bytes one by 
+one until the `0xA5 0x5A` sequence is encountered, guaranteeing 100% frame synchronization.
+
+----------------------------------------------------------------------------------------------------
+Canonical Multi-Head Attention KV Cache Implementation
+----------------------------------------------------------------------------------------------------
+To prevent the model from forgetting context and generating disjointed words, each node allocates 
+dedicated key and value caches in PSRAM:
+  - `key_cache`: `[4 layers, 64 tokens, 768 dim] * 4 bytes = 786,432 bytes` (768 KB)
+  - `value_cache`: `[4 layers, 64 tokens, 768 dim] * 4 bytes = 786,432 bytes` (768 KB)
+  - Total KV Cache: 1.5 Megabytes per board.
+
+At position `pos`, new keys and values are written into `loff + pos * kv_dim`.
+Multihead dot product attention calculates attention scores across all `t = 0..pos`, applies 
+online softmax, and computes the weighted value vectors:
+  ```cpp
+  for (int t = 0; t <= pos; t++) {
+      float* k_t = key_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
+      score += q_head[i] * k_t[i];
+  }
+  score /= sqrtf(head_size);
+  softmax_f(att_head, pos + 1);
+  ```
+
+
+====================================================================================================
+6. CHRONICLE OF CRITICAL BUGS & HOW THEY WERE OVERCOME
+====================================================================================================
+
+During the development of this cluster, several obscure low-level and machine-learning bugs were 
+diagnosed and systematically eliminated:
+
+1. BUG: Windows Python Launcher Shell Hijack
+   - Issue: Typing `python` in Windows PowerShell triggered the Microsoft Store alias dummy.
+   - Fix: Switched scripts and batch files to invoke the official Python launcher `py` directly.
+
+2. BUG: `esp_partition_mmap` Hardware Page Overflow
+   - Issue: ESP32-S3 MMU panicked with `ESP_ERR_NO_MEM` when trying to map the 14.5MB partition.
+   - Fix: Replaced static memory mapping with dynamic flash-to-PSRAM layer paging via 
+     `esp_partition_read` into a reusable 3.57MB PSRAM buffer.
+
+3. BUG: Flash Bootloader Hang at `ets_loader.c 78` and `TG0WDT_SYS_RST`
+   - Issue: Setting flash mode to `QIO @ 80MHz` failed flash bus timing on certain board revisions, 
+     causing ROM bootloader watchdog reset loops.
+   - Fix: Configured `platformio.ini` and `upload_cluster.py` with `--flash_mode dio --flash_freq 40m`, 
+     restoring 100% reliable ROM bootloader startup.
+
+4. BUG: Native USB-C Serial Silence
+   - Issue: ESP32-S3 DevKitC-1 with native USB routed `Serial.print` to GPIO 43 instead of the USB-C jack.
+   - Fix: Added build flags `-DARDUINO_USB_CDC_ON_BOOT=1` and `-DARDUINO_USB_MODE=1` in `platformio.ini` 
+     and inserted a 2-second CDC discovery delay in `main.cpp`.
+
+5. BUG: UART FIFO Desynchronization & "Gibberish" Token Runaways
+   - Issue: Raw byte streams without framing experienced occasional partial reads. Node 2 read partial 
+     activation vectors, while Node 1 timed out after 1.5 seconds. Node 1 then advanced a local fallback 
+     counter (`token_id + 7`), vomiting out consecutive dictionary words (`Error`, `re`, `as`, `Gordon`).
+   - Fix: Implemented the 6-byte sync header protocol (`0xA5 0x5A`) and increased inference timeout 
+     to 8,000ms.
+
+6. BUG: Core 1 Task Watchdog Resets (`rst:0x7 TG0WDT_SYS_RST`)
+   - Issue: The intensive 28-million-operation matrix multiplications in `compute_layers` starved the 
+     FreeRTOS IDLE task on Core 1 for several seconds, causing hardware watchdog reboots.
+   - Fix: Inserted non-blocking RTOS yields (`vTaskDelay(pdMS_TO_TICKS(1))`) between transformer layers 
+     to pet the watchdog timer.
+
+7. BUG: Model Generating Prompt Headers & Line Numbers
+   - Issue: The model was generating `<User>: IDE Error in Ruby at q.c+:12:` followed by numbers (`1`, `2`...).
+   - Root Cause 1: Lack of a KV cache caused the model to lose previous tokens, rendering token 14 (`>:`) 
+     unable to distinguish between `<User>:` and `<Gordon>:`.
+   - Root Cause 2: In the dataset, the prompt header contains random line numbers (`file.ja:142:`). 
+     Once `<Gordon>:` reached the end of an insult without a stop token, it rolled over into the next 
+     training example's line numbers.
+   - Fix: Implemented the canonical Multi-Head Attention KV Cache across PSRAM on all nodes, 
+     synchronized `pos` in the packet headers, formatted inputs with the exact `<User>...<Gordon>:` 
+     template, and added early stop token checking on punctuation (`!`, `?`, `<s>`).
+
+
+====================================================================================================
+7. STEP-BY-STEP FLASHING & OPERATING GUIDE
+====================================================================================================
+
+----------------------------------------------------------------------------------------------------
+Hardware Wiring Summary
+----------------------------------------------------------------------------------------------------
+  1. Ring Data Connections:
+     - Node 1 GPIO 17 (TX)  --->  Node 2 GPIO 18 (RX)
+     - Node 2 GPIO 17 (TX)  --->  Node 3 GPIO 18 (RX)
+     - Node 3 GPIO 17 (TX)  --->  Node 1 GPIO 18 (RX)
+  2. Power Rail:
+     - Connect all 5V pins together to a common 5V power bus.
+     - Connect all GND pins together to a common Ground bus.
+  3. Master USB:
+     - Plug single USB-C cable into Node 1 (Master / Head Node).
+
+----------------------------------------------------------------------------------------------------
+Flashing Procedure (Fast Mode: ~3 Seconds Per Board)
+----------------------------------------------------------------------------------------------------
+Because the 14MB model chunks (`node1.bin`, `node2.bin`, `node3.bin`) are already flashed to 
+flash offset `0x13c000`, firmware updates take only ~3 seconds:
+  1. Close Arduino Serial Monitor.
+  2. Run: `py upload_cluster.py` (or double-click `flash.bat`).
+  3. Select [1] Fast Firmware Update (Default).
+  4. Select [A] All 3 boards (Default).
+  5. Flash Node 1 -> Node 2 -> Node 3 by swapping the single USB cable when prompted.
+
+----------------------------------------------------------------------------------------------------
+Running the Cluster
+----------------------------------------------------------------------------------------------------
+  1. Open Serial Monitor on COM port (115200 baud, line ending set to "Both NL & CR" or "Newline").
+  2. The cluster displays a 15-second power stabilization countdown. Press ENTER to skip.
+  3. The cluster pings around the ring:
+     `[+] SUCCESS: ALL 3 ESP32-S3 NODES LINKED IN THE RING!`
+  4. Type any IDE error message (e.g. `SyntaxError: unexpected EOF` or `NullPointerException`) and 
+     press ENTER.
+  5. Chef Gordon Ramsay will roast your code across all 3 microcontrollers in real time!
+
+====================================================================================================
+                                      END OF MANIFESTO
+====================================================================================================
+

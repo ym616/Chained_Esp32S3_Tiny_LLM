@@ -2,6 +2,8 @@
 
 A distributed 3-node inference pipeline running an 86.5M parameter LLaMA-style transformer across three ESP32-S3 (N16R8) microcontrollers over a 921,600 baud UART ring. The model is fine-tuned to produce Gordon Ramsay-style roasts in response to compiler and runtime errors sent over serial.
 
+The complete development and chat transcript is recorded in [CHAT_EXPORT.md](CHAT_EXPORT.md).
+
 ---
 
 ## Technical Overview
@@ -230,6 +232,7 @@ chained_esp32s3_tiny_llm/
 ├── platformio.ini         # PlatformIO build configuration for all 3 nodes
 ├── partitions.csv         # 16MB partition table layout
 ├── PROJECT_OVERVIEW.txt   # Detailed technical documentation and bug chronicle
+├── CHAT_EXPORT.md         # Full project conversation and development transcript
 ├── README.md              # Project overview and setup instructions
 │
 ├── main/

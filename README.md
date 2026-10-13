@@ -1,182 +1,170 @@
-# Chained ESP32-S3 Tiny LLM: Distributed 86.5M Parameter Transformer Cluster
-### *"Chef Gordon Ramsay: Autonomous IDE Error Roasting Cluster"*
+# Chained ESP32-S3 Tiny LLM
 
-[![ESP32-S3](https://img.shields.io/badge/Hardware-ESP32--S3%20(N16R8)-red.svg)](https://www.espressif.com/)
-[![Parameters](https://img.shields.io/badge/Model%20Size-86.5M%20Params-blue.svg)](file:///c:/Users/Y_M/Documents/chained_esp32s3_tiny_llm/PROJECT_OVERVIEW.txt)
-[![Quantization](https://img.shields.io/badge/Quantization-Channel--Wise%204--Bit%20(Q4__0)-green.svg)](file:///c:/Users/Y_M/Documents/chained_esp32s3_tiny_llm/split_model.py)
-[![Baud](https://img.shields.io/badge/Ring%20Bus-921%2C600%20Baud%20UART-orange.svg)](file:///c:/Users/Y_M/Documents/chained_esp32s3_tiny_llm/main/main.cpp)
-[![Framework](https://img.shields.io/badge/Framework-PlatformIO%20%7C%20Arduino%20%7C%20PyTorch-purple.svg)](file:///c:/Users/Y_M/Documents/chained_esp32s3_tiny_llm/platformio.ini)
-
-A distributed pipeline-parallel Large Language Model inference engine running across a physical ring cluster of **3x ESP32-S3 microcontrollers** with **zero host computer assistance**. The cluster executes an **86.5 Million Parameter LLaMA-style Decoder-Only Transformer**, fine-tuned to act as Chef Gordon Ramsay and aggressively roast compiler errors and code bugs submitted via USB Serial.
+A distributed 3-node inference pipeline running an 86.5M parameter LLaMA-style transformer across three ESP32-S3 (N16R8) microcontrollers over a 921,600 baud UART ring. The model is fine-tuned to produce Gordon Ramsay-style roasts in response to compiler and runtime errors sent over serial.
 
 ---
 
-## 🚀 Novelty & Technical Breakthrough
+## Technical Overview
 
-Running Large Language Models on microcontrollers is conventionally restricted to models under **15M to 30M parameters** (e.g. TinyStories-15M) due to strict hardware boundaries:
-- An 86.5M parameter model in standard 32-bit floating point (FP32) consumes **~346 MB**.
-- In standard 8-bit integer quantization (INT8), it consumes **~86.5 MB**.
-- An ESP32-S3 (N16R8) has only **16 MB Flash** and **8 MB external PSRAM**.
-- Crucially, the ESP32-S3 hardware Memory Management Unit (MMU) limits virtual flash address cache mapping (`mmap`) to a **3–4 MB window**. Attempting to map any partition larger than 4MB causes an immediate `ESP_ERR_NO_MEM` hardware panic.
+Deploying an 86.5M parameter transformer on microcontrollers is constrained by both memory footprint and hardware MMU mapping:
+- In float32, 86.5M parameters take ~346 MB. In 4-bit (Q4_0), the weights occupy ~43.3 MB.
+- The ESP32-S3 (N16R8) has 16 MB of SPI flash and 8 MB of octal PSRAM.
+- The ESP32-S3 hardware MMU data cache can map at most 3 to 4 MB of flash into virtual memory at any time. Calling `esp_partition_mmap` on larger partitions fails with `ESP_ERR_NO_MEM`.
 
-### How This Project Solves It:
-1. **Ring Pipeline Spatial Parallelism**: Slices the 12 transformer layers across 3 ESP32-S3 nodes connected in a high-speed 921,600 baud UART ring.
-2. **Channel-Wise 4-Bit Packed Quantization (Q4_0)**: Compresses all weight matrices by **87.5%** down to 4 bits per weight with FP32 row scales, reducing the entire model from 346 MB to **~43.3 MB** (~14.4 MB per board).
-3. **Dynamic Flash-to-PSRAM Layer Paging**: Bypasses the 3 MB MMU mapping ceiling by dynamically paging 3.57 MB layer chunks from SPI Flash directly into an 8 MB PSRAM layer cache via DMA reads (`esp_partition_read`) in ~120 ms.
-4. **Canonical Multi-Head Attention Key-Value (KV) Cache**: Implements a full 1.5 MB KV Cache per board in PSRAM (`key_cache` and `value_cache`) with synchronized sequence positions (`pos`), eliminating context loss and sentence collapse.
-5. **Zero-Float Inner Matrix Dot Products**: Uses signed 4-bit integer multiply-accumulate operations in the inner loop, scaling by floating-point scale factors only once per output dimension.
-
----
-
-## 🏛️ System Architecture
-
-```
-                       +-----------------------------------+
-                       |        Master USB Serial          |
-                       |       (Interactive Terminal)       |
-                       +-----------------+-----------------+
-                                         |
-                                         v
-               +-------------------------------------------------------+
-               |                  NODE 1: HEAD NODE                    |
-               |  - CDC USB Serial RX/TX                               |
-               |  - BPE Tokenizer & Detokenizer (vocab=2048)           |
-               |  - Token Embeddings (2048 x 768)                      |
-               |  - Transformer Layers 0, 1, 2, 3                      |
-               |  - Canonical PSRAM KV Cache (Layers 0-3)              |
-               +---------------------------+---------------------------+
-                                           | UART Ring TX (GPIO 17)
-                                           | 921,600 Baud
-                                           v UART Ring RX (GPIO 18)
-               +-------------------------------------------------------+
-               |                  NODE 2: BODY NODE                    |
-               |  - Transformer Layers 4, 5, 6, 7                      |
-               |  - Canonical PSRAM KV Cache (Layers 4-7)              |
-               |  - RoPE Positional Rotation                           |
-               +---------------------------+---------------------------+
-                                           | UART Ring TX (GPIO 17)
-                                           | 921,600 Baud
-                                           v UART Ring RX (GPIO 18)
-               +-------------------------------------------------------+
-               |                  NODE 3: TAIL NODE                    |
-               |  - Transformer Layers 8, 9, 10, 11                    |
-               |  - Canonical PSRAM KV Cache (Layers 8-11)             |
-               |  - Final RMSNorm Layer                                |
-               |  - Language Model Head Classifier (WCLS: 768 -> 2048) |
-               |  - Temperature Softmax & Token Sampling               |
-               +---------------------------+---------------------------+
-                                           | UART Ring TX (GPIO 17)
-                                           | 921,600 Baud (Token ID)
-                                           v UART Ring RX (GPIO 18)
-                                 (Returns to Node 1)
-```
-
-### Framed UART Ring Protocol (921,600 Baud)
-All inter-node traffic uses a strict 6-byte sync frame packet protocol:
-```
-[ 0xA5 ] [ 0x5A ] [ TYPE ] [ POS ] [ LEN_HI ] [ LEN_LO ] [ PAYLOAD ... ]
-```
-- `0xA5 0x5A`: Magic synchronization bytes (prevents line noise / partial FIFO corruption).
-- `TYPE`: `0x01` (Ring Ping), `0x02` (Hidden Activation Vector, 3072 bytes FP32), `0x03` (Sampled Token ID).
-- `POS`: Current token sequence position (`0..63`) ensuring all 3 nodes index their KV caches in lockstep.
+To fit and run the model across three boards:
+1. **Pipeline Parallelism**: The 12 transformer layers are split evenly across 3 boards (4 layers per node). Hidden state vectors are passed sequentially through a unidirectional UART ring.
+2. **Channel-Wise 4-bit Quantization (Q4_0)**: All weight matrices are quantized to signed 4-bit nibbles with per-row float32 scale factors. The inner matrix multiplication runs integer multiply-accumulate operations, multiplying by the row scale once per output element.
+3. **Flash-to-PSRAM Layer Paging**: Instead of relying on `mmap`, each node allocates a 3.57 MB layer buffer in PSRAM and uses `esp_partition_read` to page layer weights from SPI flash on demand (~120 ms per layer read).
+4. **PSRAM Key-Value (KV) Cache**: Each node allocates 1.5 MB in PSRAM for multi-head attention key and value caches across its assigned layers. Sequence position (`pos`) is synchronized across boards in the packet header to prevent token drift.
+5. **Framed UART Protocol**: Serial transmission uses a 6-byte sync header (`0xA5 0x5A`, packet type, token sequence position, payload length) at 921,600 baud to prevent byte drift and UART FIFO desynchronization.
 
 ---
 
-## 🧠 Machine Learning Specs
-
-| Specification | Value | Description |
-| :--- | :--- | :--- |
-| **Model Architecture** | Decoder-Only Transformer | LLaMA / Mistral architecture |
-| **Total Parameters** | **86,512,128** | ~86.5 Million parameters |
-| **Embedding Dim (`dim`)** | **768** | Hidden representation width |
-| **FFN Dim (`hidden_dim`)**| **2048** | SwiGLU projection dimension |
-| **Transformer Layers** | **12** | 4 layers allocated per ESP32-S3 node |
-| **Attention Heads** | **12** Query / **12** KV | Multi-Head Attention (`head_dim = 64`) |
-| **Context Window** | **256** tokens | Max context length (Active MCU KV cache: 64) |
-| **Vocabulary Size** | **2,048** tokens | Custom SentencePiece BPE vocabulary |
-| **Normalization** | RMSNorm ($\epsilon = 10^{-5}$) | Root Mean Square Normalization |
-| **Position Embeddings** | Rotary (RoPE) | Precomputed frequency tables in PSRAM |
-| **Activation Function** | SwiGLU | $\text{Swish}(xW_1) \cdot (xW_3)$ |
-| **Quantization** | Channel-wise 4-bit (Q4_0) | Signed 4-bit offset-binary with FP32 row scales |
-
----
-
-## 🔌 Hardware Setup & Wiring
-
-### Bill of Materials
-- **3x ESP32-S3-WROOM-1 / DevKitC-1** (N16R8: 16MB SPI Flash, 8MB Octal PSRAM).
-- Breadboard or terminal block power bus.
-- Jumper wires.
-- 1x USB-C cable (connected to Node 1).
-
-### 1. High-Speed UART Ring Data Wiring
-Connect the hardware serial pins unidirectionally in a ring:
-| From Node / Pin | To Node / Pin | Signal / Function |
-| :--- | :--- | :--- |
-| **Node 1 GPIO 17 (TX)** | **Node 2 GPIO 18 (RX)** | Activations (Layers 0-3 &rarr; 4-7) |
-| **Node 2 GPIO 17 (TX)** | **Node 3 GPIO 18 (RX)** | Activations (Layers 4-7 &rarr; 8-11) |
-| **Node 3 GPIO 17 (TX)** | **Node 1 GPIO 18 (RX)** | Next Token ID (Sampling &rarr; Head) |
-
-### 2. Common Power Rail
-To avoid voltage ground loops and unstable UART levels:
-- Connect all **GND** pins across all three boards to a common ground bus.
-- Connect all **5V / VIN** pins together across all three boards to a common 5V bus.
-- Plug the single USB-C cable into **Node 1**. It powers the entire 3-node cluster and hosts the Serial Monitor.
-
----
-
-## ⚡ Flashing & Operating Guide
-
-### Option A: The Fast Automated Flasher (Recommended)
-
-The repository provides [upload_cluster.py](file:///c:/Users/Y_M/Documents/chained_esp32s3_tiny_llm/upload_cluster.py) and [flash.bat](file:///c:/Users/Y_M/Documents/chained_esp32s3_tiny_llm/flash.bat).
-
-1. Double-click **`flash.bat`** (or run `py upload_cluster.py`).
-2. Select your flashing mode:
-   - **`[1] Fast Firmware Update` (Default, ~3 seconds per board)**: Updates bootloader, partitions, and application code. Leaves the 14MB model weights on flash intact.
-   - **`[2] Full Flash`**: Flashes firmware AND uploads the 14MB model partition (`node1.bin`, `node2.bin`, `node3.bin`) to offset `0x13c000`.
-3. Follow the interactive prompts to plug in Node 1 &rarr; Node 2 &rarr; Node 3.
+## Architecture
 
 ```
-=======================================================
-     ESP32-S3 CLUSTER UPLOADER UTILITY
-=======================================================
-Select Flash Mode:
-  [1] Fast Firmware Update (App only, ~3 sec per board) [DEFAULT]
-  [2] Full Flash (App + 14MB Model Weights, ~2 min per board)
-Choose mode (1 or 2, default=1): 1
-[*] Auto-detected ESP32-S3 on COM5
-[*] Flashing Node 1... PASSED!
+                       +----------------------------------+
+                       |        USB Serial Terminal       |
+                       +----------------+-----------------+
+                                        |
+                                        v
+               +--------------------------------------------------+
+               |                Node 1 (Head Node)                |
+               | - USB CDC Serial RX/TX                           |
+               | - SentencePiece BPE tokenizer/detokenizer (2048) |
+               | - Embedding table (2048 x 768)                   |
+               | - Transformer layers 0 to 3                      |
+               | - PSRAM KV cache (layers 0-3)                    |
+               +------------------------+-------------------------+
+                                        | TX (GPIO 17) -> RX (GPIO 18)
+                                        | 921,600 baud
+                                        v
+               +--------------------------------------------------+
+               |                Node 2 (Body Node)                |
+               | - Transformer layers 4 to 7                      |
+               | - PSRAM KV cache (layers 4-7)                    |
+               | - Rotary position embeddings (RoPE)              |
+               +------------------------+-------------------------+
+                                        | TX (GPIO 17) -> RX (GPIO 18)
+                                        | 921,600 baud
+                                        v
+               +--------------------------------------------------+
+               |                Node 3 (Tail Node)                |
+               | - Transformer layers 8 to 11                     |
+               | - PSRAM KV cache (layers 8-11)                   |
+               | - Final RMSNorm                                  |
+               | - Classifier head (768 -> 2048)                  |
+               | - Temperature sampling                           |
+               +------------------------+-------------------------+
+                                        | TX (GPIO 17) -> RX (GPIO 18)
+                                        | 921,600 baud (Token ID)
+                                        v
+                              (Returns to Node 1)
 ```
+
+### UART Packet Framing
+```
+[0xA5] [0x5A] [TYPE] [POS] [LEN_HI] [LEN_LO] [PAYLOAD ...]
+```
+- `0xA5 0x5A`: Synchronization header.
+- `TYPE`: `0x01` (ping), `0x02` (layer activations, 3072 bytes FP32), `0x03` (sampled token ID).
+- `POS`: Current token sequence position (`0..63`) for KV cache indexing.
+- `LEN_HI` / `LEN_LO`: 16-bit payload length.
 
 ---
 
-### Option B: Manual Compilation via PlatformIO
+## Model Specifications
 
-If you want to build and flash each node individually from the command line:
+| Parameter | Value |
+| :--- | :--- |
+| Architecture | Decoder-only Transformer (LLaMA / Mistral style) |
+| Parameters | 86,512,128 (~86.5M) |
+| Hidden Dimension (`dim`) | 768 |
+| Feed-Forward Dimension (`hidden_dim`) | 2048 (SwiGLU) |
+| Total Layers | 12 (4 layers per node) |
+| Attention Heads | 12 query / 12 key-value (`head_dim = 64`) |
+| Context Window | 256 tokens max (KV cache sized to 64 tokens on device) |
+| Vocabulary Size | 2,048 tokens (SentencePiece BPE) |
+| Normalization | RMSNorm (`eps = 1e-5`) |
+| Positional Encoding | Rotary Position Embeddings (RoPE) |
+| Quantization | Channel-wise 4-bit (Q4_0), signed offset with FP32 row scales |
+
+---
+
+## Hardware and Wiring
+
+### Components
+- 3x ESP32-S3-DevKitC-1 (N16R8: 16MB Flash, 8MB Octal PSRAM)
+- Connecting jumper wires
+- Shared 5V and GND bus
+- Single USB-C cable (connected to Node 1)
+
+### Ring Data Wiring
+Connect GPIOs in a ring:
+- **Node 1 TX (GPIO 17)** -> **Node 2 RX (GPIO 18)**
+- **Node 2 TX (GPIO 17)** -> **Node 3 RX (GPIO 18)**
+- **Node 3 TX (GPIO 17)** -> **Node 1 RX (GPIO 18)**
+
+### Power Distribution
+- Connect the **GND** pins of all three boards together.
+- Connect the **5V / VIN** pins of all three boards together on a common rail.
+- Plug the USB-C cable into **Node 1**. Node 1 powers the rail and handles interactive serial communications.
+
+---
+
+## Flashing Instructions
+
+### Method 1: Automated Script (upload_cluster.py)
+
+The script handles detection, build artifacts, and flashing modes:
 
 ```bash
-# Compile and flash Node 1
-pio run -e node1 -t upload --upload-port COM5
+# On Windows, run the batch script or use the Python launcher directly:
+flash.bat
+# or:
+py upload_cluster.py
+```
 
-# Compile and flash Node 2
-pio run -e node2 -t upload --upload-port COM5
+The script offers two modes:
+1. **Mode 1: Fast Firmware Update (default)**: Flashes only the bootloader, partition table, and firmware binary (~3 seconds per board). Use this for any code changes.
+2. **Mode 2: Full Flash**: Flashes the firmware plus the 14MB model partition (`node1.bin`, `node2.bin`, `node3.bin`) to flash offset `0x13c000` (~2 minutes per board). Use this only when first provisioning new boards or when updating model weights.
 
-# Compile and flash Node 3
-pio run -e node3 -t upload --upload-port COM5
+Follow the on-screen prompt to plug in Node 1, Node 2, and Node 3 sequentially.
+
+### Method 2: Manual PlatformIO CLI
+
+To build and flash nodes individually:
+
+```bash
+# Node 1
+pio run -e node1 -t upload --upload-port COM_PORT
+
+# Node 2
+pio run -e node2 -t upload --upload-port COM_PORT
+
+# Node 3
+pio run -e node3 -t upload --upload-port COM_PORT
+```
+
+To flash the 14MB model partitions manually via `esptool`:
+
+```bash
+esptool.py --chip esp32s3 -p COM_PORT --baud 921600 write_flash --flash_mode dio --flash_freq 40m 0x13c000 nodeX.bin
 ```
 
 ---
 
-## 💬 Running Chef Gordon Ramsay
+## Running the Cluster
 
-1. Open your favorite Serial Monitor (Arduino IDE, PuTTY, or PlatformIO Monitor) connected to **Node 1** at **115,200 baud** (Set Line Ending to **"Both NL & CR"** or **"Newline"**).
-2. **Power Stabilization Buffer**: Upon startup, Node 1 initiates a 15-second countdown to allow Nodes 2 and 3 to boot and settle power on the 5V bus.
-   - *Tip: Press **ENTER** at any time to skip the countdown immediately.*
-3. **Ring Ping Verification**: The cluster pings around the ring (`Node 1 -> Node 2 -> Node 3 -> Node 1`).
-4. **Interact**: Type any compiler error, exception, or programming mistake and hit Enter!
+1. Connect the USB-C cable to **Node 1**.
+2. Open a serial monitor at **115,200 baud** with line endings set to **Both NL & CR** or **Newline**.
+3. **Power Buffer**: Node 1 counts down 15 seconds to allow Nodes 2 and 3 to boot and stabilize on the 5V bus. Press `ENTER` at any time to skip the wait.
+4. Once the ring ping succeeds, the prompt will appear.
+5. Enter any compiler error or runtime exception to generate a response.
 
-```
+### Example Console Session
+
+```text
 ========================================================
      ESP32-S3 NODE 1 INITIALIZING
 ========================================================
@@ -213,54 +201,55 @@ Examples:   'NullPointerException' or 'SyntaxError' or 'panic'
 
 ---
 
-## 🛠️ Machine Learning Training Pipeline
+## Training and Weight Export Pipeline
 
-If you want to train and export your own custom model from scratch:
+To retrain or modify the model:
 
 ```bash
-# 1. Generate 300,000 synthetic paired error-roast examples
+# 1. Generate synthetic error and roast paired dataset (300,000 samples)
 py generate_dataset.py
 
-# 2. Train custom 2048-token SentencePiece BPE tokenizer
+# 2. Train custom 2048-token SentencePiece tokenizer
 py gen_vocab.py
 
-# 3. Train the 86.5M parameter LLaMA model in PyTorch
+# 3. Train the transformer in PyTorch
 py train_tiny_llm.py
 
-# 4. Quantize to 4-bit (Q4_0) and slice across 3 cluster partitions
+# 4. Quantize to 4-bit (Q4_0) and split into node partitions
 py split_model.py my_fine_tuned_model.bin
 ```
 
 ---
 
-## 📁 Repository File Structure
+## Repository Structure
 
 ```
 chained_esp32s3_tiny_llm/
-├── flash.bat                  # One-click Windows flasher shortcut
-├── upload_cluster.py          # Interactive cluster flasher (Fast vs Full modes)
-├── platformio.ini             # PlatformIO build configuration for nodes 1, 2, 3
-├── partitions.csv             # 16MB custom flash partition layout
-├── PROJECT_OVERVIEW.txt       # Exhaustive technical manifesto & ML math breakdown
-├── README.md                  # This documentation
+├── flash.bat              # Shortcut for Windows cluster flashing
+├── upload_cluster.py      # Automated flasher script (Fast and Full modes)
+├── platformio.ini         # PlatformIO build configuration for all 3 nodes
+├── partitions.csv         # 16MB partition table layout
+├── PROJECT_OVERVIEW.txt   # Detailed technical documentation and bug chronicle
+├── README.md              # Project overview and setup instructions
 │
 ├── main/
-│   ├── main.cpp               # Core firmware (Paging, KV Cache, Ring Pipeline, Sampling)
-│   ├── vocab.h                # Embedded BPE vocabulary array & string tables
-│   └── CMakeLists.txt         # ESP-IDF component configuration
+│   ├── main.cpp           # Node firmware (layer paging, KV cache, ring pipeline)
+│   ├── vocab.h            # Static vocabulary lookup table
+│   └── CMakeLists.txt     # ESP-IDF component file
 │
-├── llama2.c/                  # PyTorch training & architecture reference
-│   ├── model.py               # Transformer model definition (RMSNorm, RoPE, SwiGLU)
-│   └── train.py               # Auto-regressive training loop
+├── llama2.c/
+│   ├── model.py           # Transformer architecture (RMSNorm, RoPE, SwiGLU)
+│   └── train.py           # PyTorch training loop
 │
-├── generate_dataset.py        # Synthetic dataset generator (300k multi-language pairs)
-├── gen_vocab.py               # SentencePiece BPE vocabulary generator
-├── train_tiny_llm.py          # PyTorch model training script
-├── split_model.py             # 4-bit channel-wise quantizer and 3-way partition slicer
-└── test_insults.py            # Local PC inference verification script
+├── generate_dataset.py    # Synthetic error-roast dataset generator
+├── gen_vocab.py           # SentencePiece vocabulary generator
+├── train_tiny_llm.py      # Training script for 86.5M parameter model
+├── split_model.py         # 4-bit quantizer and cluster slicing script
+└── test_insults.py        # Host-side validation test script
 ```
 
 ---
 
-## 📜 Full Technical Manifesto
-For deep dive documentation on mathematical formulations (RMSNorm, RoPE, Scaled Dot-Product Attention, SwiGLU), dynamic PSRAM paging benchmarks, inner assembly de-quantization loops, and the full debugging chronicle, see **[PROJECT_OVERVIEW.txt](file:///c:/Users/Y_M/Documents/chained_esp32s3_tiny_llm/PROJECT_OVERVIEW.txt)**.
+## Further Reading
+
+For an in-depth writeup covering low-level math derivations, assembly inner loops, memory layouts, and solutions to hardware/RTOS issues encountered during development (such as task watchdog resets, MMU cache limits, and UART framing desynchronization), refer to [PROJECT_OVERVIEW.txt](file:///c:/Users/Y_M/Documents/chained_esp32s3_tiny_llm/PROJECT_OVERVIEW.txt).
